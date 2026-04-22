@@ -171,6 +171,15 @@ const V12_15_ACCOUNT_SIZE_FULL: usize = 4376; // 62 cohorts (upstream default)
 /// account_id/entry_price/cohorts, added f_snap+warmup, size = 352 bytes.
 const V12_17_ENGINE_OFF: usize = slab_types::ENGINE_OFF;   // 584
 const V12_17_ACCOUNT_SIZE: usize = slab_types::EXPECTED_ACCOUNT_SIZE; // 352
+/// Trailing bytes after the accounts array in v12.17 slabs.
+/// The Percolator engine reserves a RiskEngine scratch buffer of RISK_BUF_LEN
+/// bytes plus a per-account fee-generation table (GEN_TABLE_ENTRY bytes per
+/// account). Must be included in v1217_total or detect_layout rejects every
+/// real v12.17 slab with UnrecognizedSlabLayout.
+/// Values mirror percolator-sdk/src/solana/slab.ts (V12_17_RISK_BUF_LEN,
+/// V12_17_GEN_TABLE_ENTRY) and percolator-prog/src/percolator.rs (GEN_TABLE_LEN).
+const V12_17_RISK_BUF_LEN: usize = 160;
+const V12_17_GEN_TABLE_ENTRY: usize = 8;
 
 /// Detect layout from slab data length and header.
 fn detect_layout(data: &[u8]) -> Result<SlabLayout, ProgramError> {
@@ -190,7 +199,8 @@ fn detect_layout(data: &[u8]) -> Result<SlabLayout, ProgramError> {
     // Read max_accounts. v12.15+ stores it in RiskParams (engine+32+24).
     // Older layouts stored it in the header at byte offset 8 (as u16).
     //
-    // v12.17: engine at 504, params at engine+32=536, max_accounts at params+24=560.
+    // v12.17 (post Phase A/B/E): engine at 584, params at engine+32=616,
+    // max_accounts at params+24=640.
     // v12.15: engine at 616, params at engine+32=648, max_accounts at params+24=672.
     // Both layouts have max_accounts as the 4th u64 (offset 24) in RiskParams.
     let max_accounts_v1217 = if data.len() > V12_17_ENGINE_OFF + 32 + 32 {
@@ -385,7 +395,19 @@ fn detect_layout(data: &[u8]) -> Result<SlabLayout, ProgramError> {
     let v1217_after_bitmap = v1217_bitmap_bytes + 4; // num_used+free_head
     let v1217_accounts_off_raw = v1217_bitmap_off + v1217_after_bitmap + max_accounts * 2;
     let v1217_accounts_off = (v1217_accounts_off_raw + 7) & !7; // align to 8
-    let v1217_total = v1217_accounts_off + max_accounts * V12_17_ACCOUNT_SIZE;
+    // Trailing v12.17 regions (RiskEngine scratch + per-account fee generation
+    // table) sit AFTER the accounts array. Earlier versions of this match
+    // used `accounts_off + n * ACCOUNT_SIZE` only, which short-reads every
+    // real slab by `RISK_BUF_LEN + n*GEN_TABLE_ENTRY` bytes — triggering
+    // UnrecognizedSlabLayout on the first MintPositionNft attempt against
+    // a mainnet v12.17 market. For n=256 small tier: 160 + 2048 = 2208
+    // bytes under. Computed size must match percolator-sdk's buildLayoutV12_17
+    // so frontends and on-chain agree on what a "recognizable v12.17 slab"
+    // is.
+    let v1217_total = v1217_accounts_off
+        + max_accounts * V12_17_ACCOUNT_SIZE
+        + V12_17_RISK_BUF_LEN
+        + max_accounts * V12_17_GEN_TABLE_ENTRY;
 
     if data.len() >= v1217_total && data.len() <= v1217_total + 256 {
         return Ok(SlabLayout {
