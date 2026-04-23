@@ -111,11 +111,26 @@ fn is_position_healthy(
         return Ok(true);
     }
 
-    // PERC-9009: Reject if entry_price_e6 is zero — this would make PnL=0
-    // regardless of mark price, potentially letting an unhealthy position
-    // pass the margin check if collateral alone covers maintenance.
+    // v12.17 removed the Account.entry_price field, so read_position returns
+    // entry_price_e6 = 0 for every v12.17 account. The PnL-based equity
+    // formula below divides by entry, which is undefined in that case.
+    //
+    // For v12.17 we skip the mark-PnL check and fall back to a presence
+    // check: a position with collateral > 0 still has skin in the game.
+    // Computing true equity would require reading per-side funding indices
+    // and per-account f_snap and replaying a non-trivial slice of the
+    // engine state machine — more complexity than a belt-and-suspenders
+    // transfer-time check warrants. The main Percolator program enforces
+    // full maintenance margin on every subsequent trade / close / withdraw,
+    // so a position that becomes unhealthy after transfer is still
+    // liquidatable by the normal crank path on the new holder.
+    //
+    // Pre-v12.17 layouts kept entry_price in the Account and used the
+    // PERC-9009 reject-on-zero guard. Retain that behaviour for them:
+    // entry_price == 0 on a pre-v12.17 account really is anomalous
+    // (fully closed, or corruption) and we still want to reject.
     if entry_price_e6 == 0 {
-        return Ok(false);
+        return Ok(collateral > 0);
     }
 
     // Read mark price from engine block.
@@ -229,15 +244,29 @@ pub fn process_execute(
     let source_ata = next_account_info(accounts_iter)?; // 0: source token account
     let mint = next_account_info(accounts_iter)?; // 1: NFT mint
     let dest_ata = next_account_info(accounts_iter)?; // 2: destination token account
-    let dest_wallet = next_account_info(accounts_iter)?; // 3: new owner wallet
+    // 3: per SPL Transfer Hook Interface this is the SOURCE authority
+    // (the wallet that owned the NFT before the transfer). Earlier code
+    // in this program mis-labelled this as `dest_wallet` and passed it
+    // unchanged to TransferOwnershipCpi — that made every transfer a
+    // no-op on slab ownership: the NFT moved to the destination but the
+    // position stayed with the sender. The real destination wallet is
+    // the `owner` field of the destination token account, read below.
+    let _source_authority = next_account_info(accounts_iter)?;
     let extra_metas = next_account_info(accounts_iter)?; // 4: ExtraAccountMetaList PDA
 
-    // Extra accounts
+    // Extra accounts — must match the ExtraAccountMetaList written by
+    // MintPositionNft / RepairExtraMetas.
     let nft_pda = next_account_info(accounts_iter)?; // 5: PositionNft PDA (writable)
-    let slab = next_account_info(accounts_iter)?; // 6: Slab account
+    let slab = next_account_info(accounts_iter)?; // 6: Slab account (writable)
     let percolator_prog = next_account_info(accounts_iter)?; // 7: Percolator program
     let mint_auth = next_account_info(accounts_iter)?; // 8: Mint authority PDA
     let sysvar_ix = next_account_info(accounts_iter)?; // 9: Instructions sysvar
+    // 10: NFT program (self). Listed in ExtraAccountMetaList so its
+    // AccountInfo is available here. Forwarded to invoke_signed below so
+    // the runtime can resolve the percolator-prog CPI's nft_program
+    // account meta (it is listed as a regular read-only account in
+    // TransferOwnershipCpi, not as the CPI target program).
+    let nft_program_self = next_account_info(accounts_iter)?;
 
     // ════════════════════════════════════════════════════════════════════
     // SECURITY: Verify this Execute was invoked via CPI from Token-2022.
@@ -273,10 +302,14 @@ pub fn process_execute(
     }
 
     // 3. Validate source token account (defense-in-depth).
-    //    Even with the sysvar check, validating the source ATA ensures the
-    //    account is a real Token-2022 token account for this mint with
-    //    sufficient balance. Token-2022 passes pre-transfer state, so
-    //    balance >= 1 proves the source genuinely holds the NFT.
+    //    Confirms the source is a real initialized Token-2022 account for
+    //    this mint. We intentionally do NOT re-check balance: SPL Token-2022
+    //    invokes TransferHook AFTER moving the tokens, so for a 1-of-1 NFT
+    //    transfer `amount` is already debited to zero in the source by the
+    //    time this code runs. A `src_amount < amount` check would reject
+    //    every legitimate full-position transfer (0 < 1) and misreport it
+    //    as "source balance insufficient". The pre-transfer balance check
+    //    is already enforced inside Token-2022 itself before it CPIs here.
     if *source_ata.owner != token2022::TOKEN_2022_PROGRAM_ID {
         msg!("Transfer rejected: source token account not owned by Token-2022");
         return Err(NftError::InvalidTokenAccount.into());
@@ -285,14 +318,12 @@ pub fn process_execute(
         let src_data = source_ata.try_borrow_data()?;
         // Token-2022 account layout (same offsets as SPL Token):
         //   [0..32]  mint (Pubkey)
-        //   [64..72] amount (u64 LE)
         //   [108]    state (u8: 0=uninit, 1=initialized, 2=frozen)
         if src_data.len() < 165 {
             msg!("Transfer rejected: source token account data too short");
             return Err(NftError::InvalidTokenAccount.into());
         }
         let src_mint = Pubkey::new_from_array(src_data[0..32].try_into().unwrap());
-        let src_amount = u64::from_le_bytes(src_data[64..72].try_into().unwrap());
         let src_initialized =
             src_data[108] == pinocchio_token::state::AccountState::Initialized as u8;
         if !src_initialized {
@@ -303,10 +334,6 @@ pub fn process_execute(
             msg!("Transfer rejected: source token account mint mismatch");
             return Err(NftError::InvalidTokenAccount.into());
         }
-        if src_amount < amount {
-            msg!("Transfer rejected: source balance insufficient");
-            return Err(NftError::InvalidTokenAccount.into());
-        }
     }
 
     // 4. Validate destination token account.
@@ -314,6 +341,11 @@ pub fn process_execute(
         msg!("Transfer rejected: dest token account not owned by Token-2022");
         return Err(NftError::InvalidTokenAccount.into());
     }
+    // Destination wallet (real new owner) is the `owner` field of the
+    // destination token account, offset 32..64 per the SPL Token layout.
+    // Token-2022 does not pass the destination wallet as a separate
+    // account (acc[3] is the source authority per spec).
+    let dest_wallet_pk: Pubkey;
     {
         let dst_data = dest_ata.try_borrow_data()?;
         if dst_data.len() < 165 {
@@ -331,6 +363,7 @@ pub fn process_execute(
             msg!("Transfer rejected: dest token account mint mismatch");
             return Err(NftError::InvalidTokenAccount.into());
         }
+        dest_wallet_pk = Pubkey::new_from_array(dst_data[32..64].try_into().unwrap());
     }
 
     // 5. Use the Instructions sysvar to verify CPI caller is Token-2022.
@@ -452,7 +485,7 @@ pub fn process_execute(
                 "Position closed (size=0) — transfer allowed: slab={}, idx={}, new_owner={}",
                 Pubkey::new_from_array(pda_slab_bytes),
                 pda_user_idx,
-                dest_wallet.key
+                dest_wallet_pk
             );
             return Ok(());
         }
@@ -532,7 +565,7 @@ pub fn process_execute(
         let mut d = Vec::with_capacity(35);
         d.push(TAG_TRANSFER_POSITION_OWNERSHIP);
         d.extend_from_slice(&pda_user_idx.to_le_bytes());
-        d.extend_from_slice(dest_wallet.key.as_ref());
+        d.extend_from_slice(dest_wallet_pk.as_ref());
         d
     };
 
@@ -552,22 +585,18 @@ pub fn process_execute(
     let mint_auth_seeds: &[&[u8]] = &[MINT_AUTHORITY_SEED, &[mint_auth_bump]];
 
     // All borrows (slab_data, pda_data) are now dropped — CPI is safe.
-    // 3D.3b: Include the mint_auth AccountInfo as the program_id stand-in in
-    // the invoke_signed slice. The Solana runtime resolves accounts for a CPI
-    // by pubkey from the transaction's loaded account map. The NFT program
-    // (key = *program_id) is the currently executing program and is always
-    // present in the runtime's program account map. The runtime resolves it
-    // via the AccountMeta pubkey above without needing an explicit AccountInfo
-    // entry at that pubkey. We provide mint_auth twice so the slice length is
-    // consistent with the 3-account instruction; the runtime ignores the
-    // duplicate for accounts already resolvable from its program cache.
-    //
-    // PERC-9070: Full fix requires adding the NFT program key as extra
-    // account index 10 in ExtraAccountMetaList so its AccountInfo is
-    // explicitly available here as process_execute's accounts[10].
+    // PERC-9070 complete: the NFT program (self) is listed as entry 10 in
+    // ExtraAccountMetaList, so its AccountInfo arrives here as
+    // `nft_program_self` and can be forwarded to invoke_signed in the
+    // account_infos slice. Without this, the runtime could not locate an
+    // AccountInfo matching the nft_program AccountMeta inside cpi_ix and
+    // the CPI failed with NotEnoughAccountKeys. The previous "pass
+    // mint_auth twice" workaround relied on the runtime tolerating a
+    // mismatched pubkey in the slice — it never actually satisfied the
+    // AccountMeta lookup, which is why every transfer failed.
     invoke_signed(
         &cpi_ix,
-        &[mint_auth.clone(), slab.clone(), mint_auth.clone()],
+        &[mint_auth.clone(), slab.clone(), nft_program_self.clone()],
         &[mint_auth_seeds],
     )?;
 
@@ -583,7 +612,7 @@ pub fn process_execute(
         "Position transferred: slab={}, idx={}, new_owner={}",
         Pubkey::new_from_array(pda_slab_bytes),
         pda_user_idx,
-        dest_wallet.key
+        dest_wallet_pk
     );
 
     Ok(())

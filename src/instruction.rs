@@ -89,6 +89,43 @@ pub const TAG_EXECUTE_TRANSFER_HOOK: u8 = 4;
 /// Data: tag(1)
 pub const TAG_EMERGENCY_BURN: u8 = 5;
 
+/// Tag 6: RepairExtraAccountMetas
+///
+/// Rewrite the ExtraAccountMetaList PDA data for an existing NFT mint so
+/// its flags match the current processor's `build_extra_account_metas`
+/// output — most importantly, marking the slab account writable.
+///
+/// Historical mints produced an ExtraAccountMetaList where the slab was
+/// declared read-only. That was wrong — the transfer hook CPIs into
+/// percolator-prog with `TransferOwnershipCpi` (tag 69), which mutates
+/// `Account.owner` in the slab. Without slab writable, the CPI fails with
+/// `writable privilege escalated` and every transfer bounces. Burn + remint
+/// is not a workaround: burn requires the position already be closed.
+///
+/// Permissionless by design. The only data written to the PDA is
+/// deterministic from the on-chain state of `nft_mint` + its `nft_pda`
+/// (slab, user_idx, percolator_prog_id). A caller cannot use this to forge
+/// anything — at worst they pay the tx fee to reset the PDA to its correct
+/// shape. No rent change (account is pre-sized by MintPositionNft).
+///
+/// Accounts:
+///   0. `[signer, writable]`  Payer — tops up rent when the account grows
+///                            from a 5-entry (191-byte) layout to a 6-entry
+///                            (226-byte) layout. No-op on accounts already
+///                            sized for 6 entries.
+///   1. `[writable]`          ExtraAccountMetaList PDA
+///                            seeds: `[b"extra-account-metas", nft_mint]`
+///   2. `[]`                  NFT mint (PDA seed input, no reads)
+///   3. `[]`                  PositionNft PDA
+///                            seeds: `[b"position_nft", slab, user_idx LE]`
+///                            Read for user_idx + slab + nft_mint verification.
+///   4. `[]`                  Slab account (provides slab.key + percolator_prog_id)
+///   5. `[]`                  Mint authority PDA — entry #8 in the rewritten list
+///   6. `[]`                  System program (rent top-up CPI)
+///
+/// Data: tag(1)
+pub const TAG_REPAIR_EXTRA_METAS: u8 = 6;
+
 /// Decoded instruction for the Position NFT program.
 pub enum NftInstruction {
     /// Mint an NFT for a position.
@@ -103,6 +140,8 @@ pub enum NftInstruction {
     ExecuteTransferHook { amount: u64 },
     /// Emergency burn for liquidated positions.
     EmergencyBurn,
+    /// Rewrite ExtraAccountMetaList for an existing mint (permissionless).
+    RepairExtraMetas,
 }
 
 impl NftInstruction {
@@ -132,6 +171,7 @@ impl NftInstruction {
             TAG_SETTLE_FUNDING => Ok(NftInstruction::SettleFunding),
             TAG_GET_POSITION_VALUE => Ok(NftInstruction::GetPositionValue),
             TAG_EMERGENCY_BURN => Ok(NftInstruction::EmergencyBurn),
+            TAG_REPAIR_EXTRA_METAS => Ok(NftInstruction::RepairExtraMetas),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }

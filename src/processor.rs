@@ -42,6 +42,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             crate::transfer_hook::process_execute(program_id, accounts, amount)
         }
         NftInstruction::EmergencyBurn => process_emergency_burn(program_id, accounts),
+        NftInstruction::RepairExtraMetas => process_repair_extra_metas(program_id, accounts),
     }
 }
 
@@ -463,7 +464,11 @@ fn process_mint_position_nft(
 
         // TLV account size constants.
         const EXTRA_META_ENTRY_LEN: usize = 35;
-        const EXTRA_META_COUNT: usize = 5;
+        // 6 entries: nft_pda, slab, percolator_prog, mint_auth, sysvar_ix, nft_program (self).
+        // The NFT program is listed so its AccountInfo is available in
+        // process_execute and can be forwarded as the 3rd account_info to
+        // invoke_signed when CPIing into percolator-prog (see PERC-9070).
+        const EXTRA_META_COUNT: usize = 6;
         const EXTRA_METAS_ACCOUNT_LEN: usize =
             8 /* TLV type */ + 4 /* TLV length */ + 4 /* entry count */
             + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
@@ -526,16 +531,30 @@ fn process_mint_position_nft(
         // [16..] 35 bytes per entry, in order matching process_execute:
         //   [disc(1) = 0 (FixedPubkey) | pubkey(32) | is_signer(1) | is_writable(1)]
         let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
-            // 5: PositionNft PDA — writable
+            // 5: PositionNft PDA — writable (updated during transfer)
             (*nft_pda.key, false, true),
-            // 6: Slab — read-only
-            (*slab.key, false, false),
+            // 6: Slab — writable. The transfer hook CPIs into
+            // percolator-prog with TransferOwnershipCpi (tag 69) which
+            // mutates Account.owner in the slab. If this is declared
+            // read-only, the CPI fails with "writable privilege
+            // escalated". Historical NFTs minted before this fix have
+            // the slab declared read-only in their ExtraAccountMetaList
+            // and are un-transferrable until `repair_extra_metas`
+            // (tag 6) is called against their mint.
+            (*slab.key, false, true),
             // 7: Percolator program — read-only, from verified slab.owner
             (percolator_prog_id, false, false),
             // 8: Mint authority PDA — read-only
             (*mint_auth.key, false, false),
             // 9: Instructions sysvar — read-only
             (sysvar_instructions::id(), false, false),
+            // 10: NFT program (self) — read-only. Listed so its AccountInfo
+            // arrives in process_execute and can be forwarded to
+            // invoke_signed when CPIing into percolator-prog. Without this,
+            // the CPI fails with NotEnoughAccountKeys because the runtime
+            // cannot resolve the program-id account meta from an
+            // account_infos slice that does not contain it.
+            (*program_id, false, false),
         ];
 
         for (i, (key, is_signer, is_writable)) in entries.iter().enumerate() {
@@ -1096,6 +1115,172 @@ fn process_settle_funding(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Pro
         "Funding settled: slab={}, idx={}",
         slab.key,
         nft_state.user_idx
+    );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tag 6: RepairExtraAccountMetas
+// ═══════════════════════════════════════════════════════════════
+
+/// Rewrite the ExtraAccountMetaList PDA for an existing NFT mint so its
+/// account-flag table matches the current processor's output. The
+/// original MintPositionNft emitted this PDA with the slab marked
+/// read-only, which makes every transfer fail with "writable privilege
+/// escalated" when the transfer hook CPIs TransferOwnershipCpi. Burn +
+/// remint is not a workaround — burn requires the position already closed.
+///
+/// Permissionless: the data written is fully determined by the on-chain
+/// state linked to `nft_mint` (slab key + percolator-prog id via
+/// slab.owner). A caller cannot smuggle in a malicious value.
+fn process_repair_extra_metas(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let payer = next_account_info(accounts_iter)?;       // 0: signer, writable
+    let extra_metas = next_account_info(accounts_iter)?; // 1: writable
+    let nft_mint = next_account_info(accounts_iter)?;    // 2: PDA seed input
+    let nft_pda = next_account_info(accounts_iter)?;     // 3: position NFT PDA
+    let slab = next_account_info(accounts_iter)?;        // 4: slab (read-only, for keys)
+    let mint_auth = next_account_info(accounts_iter)?;   // 5: mint auth PDA
+    let system_program = next_account_info(accounts_iter)?; // 6: system program (CPI transfer)
+
+    if !payer.is_signer {
+        msg!("RepairExtraMetas: payer must sign");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !extra_metas.is_writable {
+        msg!("RepairExtraMetas: extra_metas must be writable");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *system_program.key != solana_program::system_program::id() {
+        msg!("RepairExtraMetas: invalid system program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Verify the extra_metas PDA is derived from the claimed nft_mint AND
+    // is owned by this program — prevents rewriting an arbitrary
+    // program-owned account that merely happens to satisfy size checks.
+    // Arg order matches the function signature (mint, program_id) — same
+    // order MintPositionNft uses when it initialises the account.
+    let (expected_extra_metas, _bump) =
+        extra_account_metas_pda(nft_mint.key, program_id);
+    if *extra_metas.key != expected_extra_metas {
+        msg!("RepairExtraMetas: extra_metas PDA does not match derivation");
+        return Err(NftError::InvalidExtraAccountMetas.into());
+    }
+    if extra_metas.owner != program_id {
+        msg!("RepairExtraMetas: extra_metas PDA not owned by this program");
+        return Err(NftError::InvalidExtraAccountMetas.into());
+    }
+
+    // Verify the nft_pda is this program's PositionNft state account and
+    // links to the claimed nft_mint + slab. This pins the three-tuple
+    // (mint, slab, nft_pda) so the entries we're about to write match the
+    // original mint's state.
+    if nft_pda.owner != program_id {
+        msg!("RepairExtraMetas: nft_pda not owned by this program");
+        return Err(ProgramError::IllegalOwner);
+    }
+    let nft_state_data = nft_pda.try_borrow_data()?;
+    if nft_state_data.len() < POSITION_NFT_LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let nft_state =
+        bytemuck::from_bytes::<PositionNft>(&nft_state_data[..POSITION_NFT_LEN]);
+    if nft_state.magic != crate::state::POSITION_NFT_MAGIC {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if nft_state.slab != slab.key.to_bytes() {
+        msg!("RepairExtraMetas: nft_pda.slab does not match slab account");
+        return Err(NftError::InvalidNftPda.into());
+    }
+    if nft_state.nft_mint != nft_mint.key.to_bytes() {
+        msg!("RepairExtraMetas: nft_pda.nft_mint does not match nft_mint account");
+        return Err(NftError::InvalidNftPda.into());
+    }
+    let user_idx = nft_state.user_idx;
+    // Verify the PDA's canonical derivation.
+    let (expected_pda, _) = position_nft_pda(slab.key, user_idx, program_id);
+    if *nft_pda.key != expected_pda {
+        msg!("RepairExtraMetas: nft_pda does not match canonical derivation");
+        return Err(NftError::InvalidNftPda.into());
+    }
+    drop(nft_state_data);
+
+    // Percolator program id is read from slab.owner, so an attacker
+    // supplying a bogus slab would fail the ownership check.
+    verify_slab_owner(slab)?;
+    let percolator_prog_id = *slab.owner;
+
+    // mint_auth is validated as a canonical PDA of this program.
+    let (expected_mint_auth, _) = mint_authority_pda(program_id);
+    if *mint_auth.key != expected_mint_auth {
+        msg!("RepairExtraMetas: mint_auth PDA does not match derivation");
+        return Err(NftError::InvalidMintAuthority.into());
+    }
+
+    // Rewrite the PDA data to mirror the constants used by MintPositionNft
+    // post-fix. Six entries now: the NFT program (self) is entry 6 so its
+    // AccountInfo reaches process_execute and can be forwarded to the
+    // invoke_signed CPI into percolator-prog.
+    //
+    // The existing ExtraAccountMetaList account was sized for 5 entries
+    // (191 bytes). A 6th entry needs an extra 35 bytes of space plus a
+    // 4-byte bump to the tlv_value_len header. Grow the account with
+    // realloc before we overwrite data — repair tx pays the rent diff.
+    const EXTRA_META_ENTRY_LEN: usize = 35;
+    const EXTRA_META_COUNT: usize = 6;
+    const HEADER_LEN: usize = 16; // discriminator(8) + tlv_value_len(4) + entry_count(4)
+    const EXTRA_METAS_ACCOUNT_LEN: usize =
+        HEADER_LEN + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT; // 226
+
+    let mut data = extra_metas.try_borrow_mut_data()?;
+    if data.len() < EXTRA_METAS_ACCOUNT_LEN {
+        drop(data);
+        // Top up rent for the larger size BEFORE realloc so the end-of-tx
+        // rent-exempt check passes. realloc itself does not move lamports.
+        let rent = Rent::get()?;
+        let needed = rent.minimum_balance(EXTRA_METAS_ACCOUNT_LEN);
+        let current = extra_metas.lamports();
+        if needed > current {
+            let top_up = needed - current;
+            invoke(
+                &system_instruction::transfer(payer.key, extra_metas.key, top_up),
+                &[payer.clone(), extra_metas.clone(), system_program.clone()],
+            )?;
+        }
+        extra_metas.realloc(EXTRA_METAS_ACCOUNT_LEN, true)?;
+        data = extra_metas.try_borrow_mut_data()?;
+    }
+
+    // Header (same layout as mint).
+    data[0..8].copy_from_slice(&EXECUTE_DISCRIMINATOR);
+    let tlv_value_len: u32 = (4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT) as u32;
+    data[8..12].copy_from_slice(&tlv_value_len.to_le_bytes());
+    data[12..16].copy_from_slice(&(EXTRA_META_COUNT as u32).to_le_bytes());
+
+    let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
+        (*nft_pda.key, false, true),                 // 5: PositionNft PDA — writable
+        (*slab.key, false, true),                    // 6: Slab — WRITABLE (the fix)
+        (percolator_prog_id, false, false),          // 7: Percolator program — read-only
+        (*mint_auth.key, false, false),              // 8: Mint authority PDA — read-only
+        (sysvar_instructions::id(), false, false),   // 9: Instructions sysvar — read-only
+        (*program_id, false, false),                 // 10: NFT program (self) — read-only
+    ];
+    for (i, (key, is_signer, is_writable)) in entries.iter().enumerate() {
+        let off = HEADER_LEN + i * EXTRA_META_ENTRY_LEN;
+        data[off] = 0;
+        data[off + 1..off + 33].copy_from_slice(key.as_ref());
+        data[off + 33] = if *is_signer { 1 } else { 0 };
+        data[off + 34] = if *is_writable { 1 } else { 0 };
+    }
+
+    msg!(
+        "RepairExtraMetas: rewrote ExtraAccountMetaList for mint {} (slab now writable)",
+        nft_mint.key
     );
     Ok(())
 }
