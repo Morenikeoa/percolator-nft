@@ -689,24 +689,70 @@ pub struct RiskEngine {
     /// Count of accounts with PNL < 0 (spec §4.7, v12.16.4).
     pub neg_pnl_account_count: u64,
 
-    /// Wave 4a / KL-FORK-ENGINE-BANKRUPT-CLOSE-1 (gate-only port).
-    /// Engine PR #92 merged at `de6e1686` adds the bankrupt-close gate
-    /// surface to `RiskEngine`: `bankruptcy_hmax_lock_active: bool`
-    /// and `active_close_present: u8`. The pair takes 2 bytes plus 6
-    /// bytes of trailing padding before the next u64-aligned field
-    /// (the `oracle_target_price_e6` Wave 1 added below) — net +8
-    /// bytes schema growth.
-    ///
-    /// On the gate-only branch these fields have no setter; the helper
-    /// `engine.ensure_no_active_bankrupt_close()` always returns Ok(()).
-    /// Wave 5b will add the state-machine setters that flip
-    /// `active_close_present` to non-zero during recovery flows.
-    /// Mirroring them here keeps the SBF byte layout coherent with
-    /// fork engine so the NFT slab parser doesn't see a 8-byte offset
-    /// drift on every field below.
+    /// Wave 4a / KL-FORK-ENGINE-BANKRUPT-CLOSE-1 (gate-only port,
+    /// engine PR #92 @ `de6e1686`).
     pub bankruptcy_hmax_lock_active: bool,
     pub active_close_present: u8,
-    pub _bankrupt_close_pad: [u8; 6],
+
+    /// Wave 5b / KL-FORK-ENGINE-BANKRUPT-CLOSE-1 (state-machine
+    /// schema, engine PR #94 @ `a67ff66d`). 10 state-machine fields
+    /// (the 9 listed in toly:843-852 plus the gate variable
+    /// `active_close_present` which Wave 4a added separately above).
+    /// Replaces Wave 4b's `_bankrupt_close_pad: [u8; 6]` with 96 bytes
+    /// of useful state — net schema growth +88 in this cluster.
+    ///
+    /// On the schema-only branch every state-machine field stays at
+    /// its no-continuation default forever (no setter exists on this
+    /// engine commit). Wave 5b-ii ports the setters and integrates
+    /// the state machine into trade/accrue/resolve paths.
+    ///
+    /// `_active_close_pad: [u8; 3]` is the explicit padding the Rust
+    /// `#[repr(C)]` layout would otherwise insert between
+    /// `active_close_opp_side: u8` and `active_close_close_price: u64`
+    /// (the latter needs 8-byte alignment). Spelling it out keeps the
+    /// byte-budget legible against the closed-form
+    /// `EXPECTED_RISK_ENGINE_SIZE` formula.
+    pub active_close_phase: u8,
+    pub active_close_account_idx: u16,
+    pub active_close_opp_side: u8,
+    pub _active_close_pad: [u8; 3],
+    pub active_close_close_price: u64,
+    pub active_close_close_slot: u64,
+    /// Native `u128` upstream; wrapped here.
+    pub active_close_q_close_q: U128,
+    /// Native `u128` upstream; wrapped here.
+    pub active_close_residual_remaining: U128,
+    /// Native `u128` upstream; wrapped here.
+    pub active_close_residual_booked: U128,
+    /// Native `u128` upstream; wrapped here.
+    pub active_close_residual_recorded: U128,
+    pub active_close_b_chunks_booked: u64,
+
+    /// Wave 5a / KL-FORK-ENGINE-STRESS-ENVELOPE-1 (schema-only port,
+    /// engine PR #93 @ `9d167a62`). 4 RiskEngine fields tracking the
+    /// post-stress recovery envelope. +40 bytes schema growth at u128
+    /// alignment, no padding required.
+    ///
+    /// All four stay at `0` / `NO_SLOT` forever on this branch — the
+    /// setters (`start_post_stress_recovery_envelope`,
+    /// `apply_stress_envelope_progress`) port in Wave 5b-ii combined
+    /// with the bankrupt-close state machine reconciliation path.
+    /// Mirroring them here keeps the SBF byte layout coherent.
+    ///
+    /// Native `u128` upstream; wrapped here.
+    pub stress_consumed_bps_e9_since_envelope: U128,
+    pub stress_envelope_remaining_indices: u64,
+    /// `NO_SLOT` (`u64::MAX`) means no envelope is active.
+    pub stress_envelope_start_slot: u64,
+    /// `NO_SLOT` (`u64::MAX`) means no envelope is active.
+    pub stress_envelope_start_generation: u64,
+
+    /// Wave 5b auxiliary stress timing (engine PR #94 @ `a67ff66d`,
+    /// toly:832). Last slot at which `sweep_generation` advanced;
+    /// `NO_SLOT` means never. +8 bytes. Stays at NO_SLOT forever on
+    /// this branch — Wave 5b-ii's `apply_stress_envelope_progress`
+    /// is its lone reader/writer.
+    pub last_sweep_generation_advance_slot: u64,
 
     /// Wave 1 / ENG-PORT-C: external-oracle target tracking (per
     /// fork engine `RiskEngine` schema change merged via engine PR #91
@@ -780,9 +826,34 @@ pub const EXPECTED_RISK_ENGINE_SIZE: usize = {
     // `neg_pnl_account_count` and the Wave 1 oracle_target_* pair, plus
     // 6 bytes of alignment padding before the next u64. Combined: +8 bytes.
     //
-    // Pre-Wave-1 fixed_prefix was 712 (v12.17 layout). Wave 1 → 728.
-    // Wave 4a → 728 + 8 = 736.
-    let fixed_prefix: usize = 736;
+    // Wave 5a (engine PR #93 @ 9d167a62): added 4 stress-envelope fields
+    // (u128 + 3× u64) for +40 bytes at u128 alignment.
+    //
+    // Wave 5b (engine PR #94 @ a67ff66d): added 10 bankrupt-close
+    // state-machine fields (u8+u16+u8+3pad+u64+u64+4×u128+u64 = 96 bytes
+    // useful state) replacing Wave 4a's 6 bytes of alignment padding —
+    // net +88 in the bankrupt-close cluster. Plus auxiliary
+    // `last_sweep_generation_advance_slot: u64` for +8 bytes elsewhere.
+    // Combined Wave 5b: +96 bytes.
+    //
+    // Wave 5b/5c: empirically derived from `offset_of!()` against the
+    // mirror's actual post-Wave-5b layout. `used` lands at engine-rel
+    // 880. Note: the mirror uses `U128` wrapper (`#[repr(C)] struct
+    // U128(pub [u64; 2])`, align=8) instead of native `u128` (align=16),
+    // so the mirror's u128-equivalent fields don't force 16-byte
+    // alignment padding — this is the ONLY layout divergence vs engine
+    // in the active_close / stress / oracle_target region. Engine has
+    // `used` at engine-rel 928 because it includes 32 bytes of v12.19
+    // cursor state (rr_cursor + sweep_gen + price_move_consumed) that
+    // the mirror still carries on v12.17 schema (separate
+    // long-standing drift, KL-FORK-NFT-MIRROR-V1217-DRIFT).
+    //
+    // Pre-Wave-1: 712. Wave 1 → 728. Wave 4a → 736. Wave 5a → 752
+    // (40 bytes of stress fields, no extra align pad due to U128
+    // wrapper). Wave 5b → 880 (96 net useful state-machine bytes
+    // including 6 bytes from Wave 4a pad consumed and 8 bytes
+    // `last_sweep_generation_advance_slot`, plus internal alignment).
+    let fixed_prefix: usize = 880;
     let used_bytes: usize = 8 * BITMAP_WORDS;
     // num_used_accounts(u16) + free_head(u16) = 4 bytes; next u64 boundary = 8 bytes total
     let mid: usize = 4;
@@ -817,18 +888,32 @@ const _: () = assert!(ENGINE_REL_MAX_ACCOUNTS_FIELD == 32 + 24); // params+24
 const _: () = assert!(ENGINE_REL_C_TOT == 336);
 const _: () = assert!(ENGINE_REL_PNL_POS_TOT == 352);
 const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 616);
-// Wave 1 (engine PR #91 @ 8e3df3db) inserted oracle_target_price_e6 (u64) +
-// oracle_target_publish_time (i64) at engine+624, shifting downstream by +16.
-// Wave 4a (engine PR #92 @ de6e1686) inserted
-// `bankruptcy_hmax_lock_active: bool` + `active_close_present: u8` + 6 bytes
-// padding at engine+624, shifting every offset downstream of
-// `neg_pnl_account_count` by an ADDITIONAL +8 bytes (cumulative: +24 from
-// pre-Wave-1).
-const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 648);
-const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 656);
-const _: () = assert!(ENGINE_REL_F_LONG_NUM == 672);
-const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 688);
-const _: () = assert!(ENGINE_REL_USED == 736);
+// Wave 1 (engine PR #91 @ 8e3df3db): +16 bytes (oracle_target_price_e6 + oracle_target_publish_time).
+// Wave 4a (engine PR #92 @ de6e1686): +8 bytes (bankrupt-close gate + 6-byte align pad).
+// Wave 5a (engine PR #93 @ 9d167a62): +40 bytes useful + 8 bytes u128 align pad
+//   between b_chunks_booked u64 and stress_consumed u128 = +48 effective.
+// Wave 5b (engine PR #94 @ a67ff66d): +96 bytes useful (10 state-machine
+//   fields consuming Wave 4a's 6-byte pad + extra u128 align bytes).
+//
+// Wave 5b/5c mirror offsets (verified via offset_of! dump). The
+// mirror's actual layout is +176 bytes downstream of
+// `neg_pnl_account_count` vs the pre-Wave-1 baseline:
+//   Wave 1 +16: oracle_target_price_e6 + oracle_target_publish_time
+//   Wave 4a +8: bankrupt-close gate fields + 6 bytes of mirror-side
+//               internal padding (compiler-inserted on the explicit
+//               `_active_close_pad: [u8; 3]` block — explicit pad +
+//               implicit alignment combine to land u64 close_price at
+//               offset 640 vs 632; the gap between mirror and engine
+//               here is identical because both end up at byte 640).
+//   Wave 5a +8: u128-equivalent stress block (40 bytes useful, but
+//               mirror uses U128 wrapper at align=8 so no extra pad).
+//               Net mirror impact: +40 bytes useful + 0 align pad.
+//   Wave 5b +96: state machine fields + last_sweep_generation_advance_slot.
+const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 792);
+const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 800);
+const _: () = assert!(ENGINE_REL_F_LONG_NUM == 816);
+const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 832);
+const _: () = assert!(ENGINE_REL_USED == 880);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Slab geometry — verbatim from percolator-prog/src/lib.rs:47-72
@@ -883,12 +968,12 @@ const _: () = assert!(SLAB_OFF_MAX_ACCOUNTS == 584 + 56);        // 640
 const _: () = assert!(SLAB_OFF_C_TOT == 584 + 336);              // 920
 const _: () = assert!(SLAB_OFF_PNL_POS_TOT == 584 + 352);        // 936
 const _: () = assert!(SLAB_OFF_NEG_PNL_ACCOUNT_COUNT == 584 + 616); // 1200
-// Wave 1 + Wave 4a shifts (cumulative +24 bytes downstream of
-// `neg_pnl_account_count`): Wave 1 added oracle_target_price_e6 +
-// oracle_target_publish_time (+16); Wave 4a added bankruptcy_hmax_lock_active
-// + active_close_present + 6 bytes padding (+8).
-const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 648);  // 1232
-const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 656);       // 1240
-const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 672);         // 1256
-const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 688);        // 1272
-const _: () = assert!(SLAB_OFF_USED == 584 + 736);               // 1320
+// Wave 1 + Wave 4a + Wave 5a + Wave 5b cumulative effective shift +176
+// bytes downstream of `neg_pnl_account_count` (includes natural u128
+// alignment pads inserted by the Rust compiler):
+// Slab offsets follow ENGINE_OFF + ENGINE_REL_*. ENGINE_OFF = 584.
+const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 792);  // 1376
+const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 800);       // 1384
+const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 816);         // 1400
+const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 832);        // 1416
+const _: () = assert!(SLAB_OFF_USED == 584 + 880);               // 1464
