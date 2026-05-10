@@ -679,10 +679,20 @@ pub struct RiskEngine {
     pub stale_account_count_long: u64,
     pub stale_account_count_short: u64,
 
-    /// Native `u128` upstream; wrapped here.
-    pub phantom_dust_bound_long_q: U128,
-    /// Native `u128` upstream; wrapped here.
-    pub phantom_dust_bound_short_q: U128,
+    /// Wave 6c / KL-PHANTOM-DUST-SCHEMA-1 (REVOKED in engine PR #95):
+    /// adopt toly's 4-field phantom-dust schema (certified + potential per
+    /// side, toly:783-786). Engine fields are native `u128`; wrapped here
+    /// as `U128` (8-byte aligned) per the NFT mirror's `#[repr(C)]`
+    /// convention.
+    ///
+    /// `certified_<side>_q` is the lower bound — always 0 on engine main
+    /// (no B-tracking-aware certification logic). `potential_<side>_q` is
+    /// the upper bound — renamed from `phantom_dust_bound_<side>_q`,
+    /// semantically identical.
+    pub phantom_dust_certified_long_q: U128,
+    pub phantom_dust_certified_short_q: U128,
+    pub phantom_dust_potential_long_q: U128,
+    pub phantom_dust_potential_short_q: U128,
 
     pub materialized_account_count: u64,
 
@@ -853,7 +863,11 @@ pub const EXPECTED_RISK_ENGINE_SIZE: usize = {
     // wrapper). Wave 5b → 880 (96 net useful state-machine bytes
     // including 6 bytes from Wave 4a pad consumed and 8 bytes
     // `last_sweep_generation_advance_slot`, plus internal alignment).
-    let fixed_prefix: usize = 880;
+    //
+    // Wave 6c (engine PR #95 @ 8a8776e): phantom-dust 4-field schema
+    // swap (2 × U128 → 4 × U128 per side; +32 bytes net at 8-byte
+    // alignment). Mirror grows to 912.
+    let fixed_prefix: usize = 912;
     let used_bytes: usize = 8 * BITMAP_WORDS;
     // num_used_accounts(u16) + free_head(u16) = 4 bytes; next u64 boundary = 8 bytes total
     let mid: usize = 4;
@@ -887,17 +901,17 @@ const _: () = assert!(ENGINE_REL_MAINT_MARGIN_BPS == 32); // params at 32, maint
 const _: () = assert!(ENGINE_REL_MAX_ACCOUNTS_FIELD == 32 + 24); // params+24
 const _: () = assert!(ENGINE_REL_C_TOT == 336);
 const _: () = assert!(ENGINE_REL_PNL_POS_TOT == 352);
-const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 616);
+const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 648);
 // Wave 1 (engine PR #91 @ 8e3df3db): +16 bytes (oracle_target_price_e6 + oracle_target_publish_time).
 // Wave 4a (engine PR #92 @ de6e1686): +8 bytes (bankrupt-close gate + 6-byte align pad).
 // Wave 5a (engine PR #93 @ 9d167a62): +40 bytes useful + 8 bytes u128 align pad
 //   between b_chunks_booked u64 and stress_consumed u128 = +48 effective.
 // Wave 5b (engine PR #94 @ a67ff66d): +96 bytes useful (10 state-machine
 //   fields consuming Wave 4a's 6-byte pad + extra u128 align bytes).
+// Wave 6c (engine PR #95 @ 8a8776e): +32 bytes (phantom-dust 4-field
+//   schema swap, 2 × U128 → 4 × U128 at 8-byte alignment).
 //
-// Wave 5b/5c mirror offsets (verified via offset_of! dump). The
-// mirror's actual layout is +176 bytes downstream of
-// `neg_pnl_account_count` vs the pre-Wave-1 baseline:
+// Wave 6c mirror offsets shift all post-phantom_dust constants by +32:
 //   Wave 1 +16: oracle_target_price_e6 + oracle_target_publish_time
 //   Wave 4a +8: bankrupt-close gate fields + 6 bytes of mirror-side
 //               internal padding (compiler-inserted on the explicit
@@ -909,11 +923,14 @@ const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 616);
 //               mirror uses U128 wrapper at align=8 so no extra pad).
 //               Net mirror impact: +40 bytes useful + 0 align pad.
 //   Wave 5b +96: state machine fields + last_sweep_generation_advance_slot.
-const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 792);
-const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 800);
-const _: () = assert!(ENGINE_REL_F_LONG_NUM == 816);
-const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 832);
-const _: () = assert!(ENGINE_REL_USED == 880);
+//   Wave 6c +32: 2 new U128 phantom_dust_certified fields inserted
+//               BEFORE the renamed phantom_dust_potential pair. All
+//               downstream offsets shift +32.
+const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 824);
+const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 832);
+const _: () = assert!(ENGINE_REL_F_LONG_NUM == 848);
+const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 864);
+const _: () = assert!(ENGINE_REL_USED == 912);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Slab geometry — verbatim from percolator-prog/src/lib.rs:47-72
@@ -967,13 +984,13 @@ const _: () = assert!(SLAB_OFF_MAINT_MARGIN_BPS == 584 + 32);   // 616
 const _: () = assert!(SLAB_OFF_MAX_ACCOUNTS == 584 + 56);        // 640
 const _: () = assert!(SLAB_OFF_C_TOT == 584 + 336);              // 920
 const _: () = assert!(SLAB_OFF_PNL_POS_TOT == 584 + 352);        // 936
-const _: () = assert!(SLAB_OFF_NEG_PNL_ACCOUNT_COUNT == 584 + 616); // 1200
+const _: () = assert!(SLAB_OFF_NEG_PNL_ACCOUNT_COUNT == 584 + 648); // 1232
 // Wave 1 + Wave 4a + Wave 5a + Wave 5b cumulative effective shift +176
 // bytes downstream of `neg_pnl_account_count` (includes natural u128
 // alignment pads inserted by the Rust compiler):
 // Slab offsets follow ENGINE_OFF + ENGINE_REL_*. ENGINE_OFF = 584.
-const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 792);  // 1376
-const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 800);       // 1384
-const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 816);         // 1400
-const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 832);        // 1416
-const _: () = assert!(SLAB_OFF_USED == 584 + 880);               // 1464
+const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 824);  // 1408
+const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 832);       // 1416
+const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 848);         // 1432
+const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 864);        // 1448
+const _: () = assert!(SLAB_OFF_USED == 584 + 912);               // 1496
