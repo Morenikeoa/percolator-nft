@@ -689,6 +689,25 @@ pub struct RiskEngine {
     /// Count of accounts with PNL < 0 (spec §4.7, v12.16.4).
     pub neg_pnl_account_count: u64,
 
+    /// Wave 4a / KL-FORK-ENGINE-BANKRUPT-CLOSE-1 (gate-only port).
+    /// Engine PR #92 merged at `de6e1686` adds the bankrupt-close gate
+    /// surface to `RiskEngine`: `bankruptcy_hmax_lock_active: bool`
+    /// and `active_close_present: u8`. The pair takes 2 bytes plus 6
+    /// bytes of trailing padding before the next u64-aligned field
+    /// (the `oracle_target_price_e6` Wave 1 added below) — net +8
+    /// bytes schema growth.
+    ///
+    /// On the gate-only branch these fields have no setter; the helper
+    /// `engine.ensure_no_active_bankrupt_close()` always returns Ok(()).
+    /// Wave 5b will add the state-machine setters that flip
+    /// `active_close_present` to non-zero during recovery flows.
+    /// Mirroring them here keeps the SBF byte layout coherent with
+    /// fork engine so the NFT slab parser doesn't see a 8-byte offset
+    /// drift on every field below.
+    pub bankruptcy_hmax_lock_active: bool,
+    pub active_close_present: u8,
+    pub _bankrupt_close_pad: [u8; 6],
+
     /// Wave 1 / ENG-PORT-C: external-oracle target tracking (per
     /// fork engine `RiskEngine` schema change merged via engine PR #91
     /// at SHA `8e3df3db`). Toly hosts these on `MarketConfig` (wrapper-side);
@@ -754,12 +773,16 @@ pub const EXPECTED_RISK_ENGINE_SIZE: usize = {
     // Wave 1 (engine PR #91 @ 8e3df3db): added two RiskEngine fields —
     // `oracle_target_price_e6: u64` (8 bytes) and
     // `oracle_target_publish_time: i64` (8 bytes), inserted between
-    // `neg_pnl_account_count` and `last_oracle_price`. Both fields are
-    // 8-byte aligned; combined they widen the fixed prefix by 16 bytes.
+    // `neg_pnl_account_count` and `last_oracle_price`. Combined: +16 bytes.
     //
-    // Pre-Wave-1 fixed_prefix was 712 (v12.17 layout, when `bitmap`
-    // started at engine+712). Wave 1 → 712 + 16 = 728.
-    let fixed_prefix: usize = 728;
+    // Wave 4a (engine PR #92 @ de6e1686): added two more — `bankruptcy_hmax_lock_active: bool`
+    // (1 byte) + `active_close_present: u8` (1 byte) inserted between
+    // `neg_pnl_account_count` and the Wave 1 oracle_target_* pair, plus
+    // 6 bytes of alignment padding before the next u64. Combined: +8 bytes.
+    //
+    // Pre-Wave-1 fixed_prefix was 712 (v12.17 layout). Wave 1 → 728.
+    // Wave 4a → 728 + 8 = 736.
+    let fixed_prefix: usize = 736;
     let used_bytes: usize = 8 * BITMAP_WORDS;
     // num_used_accounts(u16) + free_head(u16) = 4 bytes; next u64 boundary = 8 bytes total
     let mid: usize = 4;
@@ -795,13 +818,17 @@ const _: () = assert!(ENGINE_REL_C_TOT == 336);
 const _: () = assert!(ENGINE_REL_PNL_POS_TOT == 352);
 const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 616);
 // Wave 1 (engine PR #91 @ 8e3df3db) inserted oracle_target_price_e6 (u64) +
-// oracle_target_publish_time (i64) at engine+624, shifting every offset
-// downstream of `neg_pnl_account_count` by +16 bytes.
-const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 640);
-const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 648);
-const _: () = assert!(ENGINE_REL_F_LONG_NUM == 664);
-const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 680);
-const _: () = assert!(ENGINE_REL_USED == 728);
+// oracle_target_publish_time (i64) at engine+624, shifting downstream by +16.
+// Wave 4a (engine PR #92 @ de6e1686) inserted
+// `bankruptcy_hmax_lock_active: bool` + `active_close_present: u8` + 6 bytes
+// padding at engine+624, shifting every offset downstream of
+// `neg_pnl_account_count` by an ADDITIONAL +8 bytes (cumulative: +24 from
+// pre-Wave-1).
+const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 648);
+const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 656);
+const _: () = assert!(ENGINE_REL_F_LONG_NUM == 672);
+const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 688);
+const _: () = assert!(ENGINE_REL_USED == 736);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Slab geometry — verbatim from percolator-prog/src/lib.rs:47-72
@@ -856,11 +883,12 @@ const _: () = assert!(SLAB_OFF_MAX_ACCOUNTS == 584 + 56);        // 640
 const _: () = assert!(SLAB_OFF_C_TOT == 584 + 336);              // 920
 const _: () = assert!(SLAB_OFF_PNL_POS_TOT == 584 + 352);        // 936
 const _: () = assert!(SLAB_OFF_NEG_PNL_ACCOUNT_COUNT == 584 + 616); // 1200
-// Wave 1 shift (+16 bytes; oracle_target_price_e6 + oracle_target_publish_time
-// inserted at engine+624). All slab offsets downstream of
-// `neg_pnl_account_count` shift by 16.
-const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 640);  // 1224
-const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 648);       // 1232
-const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 664);         // 1248
-const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 680);        // 1264
-const _: () = assert!(SLAB_OFF_USED == 584 + 728);               // 1312
+// Wave 1 + Wave 4a shifts (cumulative +24 bytes downstream of
+// `neg_pnl_account_count`): Wave 1 added oracle_target_price_e6 +
+// oracle_target_publish_time (+16); Wave 4a added bankruptcy_hmax_lock_active
+// + active_close_present + 6 bytes padding (+8).
+const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 648);  // 1232
+const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 656);       // 1240
+const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 672);         // 1256
+const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 688);        // 1272
+const _: () = assert!(SLAB_OFF_USED == 584 + 736);               // 1320
