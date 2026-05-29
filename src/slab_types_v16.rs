@@ -180,7 +180,25 @@ impl V16PodI128 {
     }
 }
 
+/// Signed 64-bit, align-1 byte array. Used by the NFT's own `PositionNftV16`
+/// state (e.g. `minted_at`); the engine has no signed-u64 field so there is no
+/// engine counterpart, but the same byte-determinism discipline applies.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
+pub struct V16PodI64 {
+    pub bytes: [u8; 8],
+}
+impl V16PodI64 {
+    pub fn new(value: i64) -> Self {
+        Self { bytes: value.to_le_bytes() }
+    }
+    pub fn get(self) -> i64 {
+        i64::from_le_bytes(self.bytes)
+    }
+}
+
 const _: () = assert!(size_of::<V16PodU16>() == 2 && align_of::<V16PodU16>() == 1);
+const _: () = assert!(size_of::<V16PodI64>() == 8 && align_of::<V16PodI64>() == 1);
 const _: () = assert!(size_of::<V16PodU32>() == 4 && align_of::<V16PodU32>() == 1);
 const _: () = assert!(size_of::<V16PodU64>() == 8 && align_of::<V16PodU64>() == 1);
 const _: () = assert!(size_of::<V16PodU128>() == 16 && align_of::<V16PodU128>() == 1);
@@ -456,6 +474,56 @@ impl PortfolioAccountV16Account {
     pub fn portfolio_locked_or_stale(&self) -> bool {
         self.liquidation_lock != 0 || self.stale_state != 0 || self.b_stale_state != 0
     }
+
+    /// Decide whether the leg trading `asset_index` may have its ownership /
+    /// NFT freely transferred RIGHT NOW. This is the single consolidated gate
+    /// the transfer-hook and the wrapper's B-3 `TransferPortfolioOwnership`
+    /// must both consult — it encodes original NFT bug #3 (closed/resolved
+    /// position transfer must be blocked) against the v16 close/resolve model.
+    ///
+    /// Returns `Transferable(slot)` only when an active leg for the asset
+    /// exists AND no close/resolve/stale/lock gate is engaged; otherwise the
+    /// precise blocking reason (callers map it to an error / EmergencyBurn).
+    pub fn leg_transfer_gate(&self, asset_index: u32) -> LegTransferGate {
+        let slot = match self.active_leg_slot_for_asset(asset_index) {
+            Some(s) => s,
+            None => return LegTransferGate::NoActiveLeg,
+        };
+        if self.portfolio_locked_or_stale() {
+            return LegTransferGate::PortfolioLockedOrStale;
+        }
+        if self.has_resolved_receipt() {
+            return LegTransferGate::Resolved;
+        }
+        if self.close_in_progress_for_asset(asset_index) {
+            return LegTransferGate::CloseInProgress;
+        }
+        let leg = &self.legs[slot];
+        if leg.b_stale != 0 || leg.stale != 0 {
+            return LegTransferGate::LegStale;
+        }
+        LegTransferGate::Transferable(slot)
+    }
+}
+
+/// Result of [`PortfolioAccountV16Account::leg_transfer_gate`]. Each non-OK
+/// variant is a distinct reason the position is not freely transferable, so a
+/// caller can return a precise error or route to EmergencyBurn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegTransferGate {
+    /// The bound leg is active and unencumbered; transfer permitted. Carries
+    /// the leg array slot.
+    Transferable(usize),
+    /// No active leg trades this asset (closed / never existed) — use EmergencyBurn.
+    NoActiveLeg,
+    /// A close is in progress for this asset's leg.
+    CloseInProgress,
+    /// The portfolio has a terminal resolved-payout receipt.
+    Resolved,
+    /// Portfolio-level liquidation lock or stale state engaged.
+    PortfolioLockedOrStale,
+    /// The bound leg itself is marked stale / b_stale.
+    LegStale,
 }
 
 #[cfg(test)]
@@ -559,6 +627,48 @@ mod tests {
             decode_portfolio(&buf),
             Err(PortfolioDecodeError::BadLayoutDiscriminator)
         );
+    }
+
+    #[test]
+    fn leg_transfer_gate_variants() {
+        // No active leg for asset 7 -> NoActiveLeg.
+        let mut acct = empty_account();
+        assert_eq!(acct.leg_transfer_gate(7), LegTransferGate::NoActiveLeg);
+
+        // Active leg, nothing engaged -> Transferable(slot).
+        acct.legs[2].active = 1;
+        acct.legs[2].asset_index = V16PodU32::new(7);
+        assert_eq!(acct.leg_transfer_gate(7), LegTransferGate::Transferable(2));
+
+        // Portfolio lock blocks.
+        acct.liquidation_lock = 1;
+        assert_eq!(
+            acct.leg_transfer_gate(7),
+            LegTransferGate::PortfolioLockedOrStale
+        );
+        acct.liquidation_lock = 0;
+
+        // Resolved receipt blocks.
+        acct.resolved_payout_receipt.present = 1;
+        assert_eq!(acct.leg_transfer_gate(7), LegTransferGate::Resolved);
+        acct.resolved_payout_receipt.present = 0;
+
+        // Close-in-progress for this asset blocks.
+        acct.close_progress.active = 1;
+        acct.close_progress.asset_index = V16PodU32::new(7);
+        assert_eq!(acct.leg_transfer_gate(7), LegTransferGate::CloseInProgress);
+        acct.close_progress.active = 0;
+
+        // Per-leg stale blocks.
+        acct.legs[2].stale = 1;
+        assert_eq!(acct.leg_transfer_gate(7), LegTransferGate::LegStale);
+        acct.legs[2].stale = 0;
+        acct.legs[2].b_stale = 1;
+        assert_eq!(acct.leg_transfer_gate(7), LegTransferGate::LegStale);
+        acct.legs[2].b_stale = 0;
+
+        // Back to clean -> Transferable.
+        assert_eq!(acct.leg_transfer_gate(7), LegTransferGate::Transferable(2));
     }
 
     #[test]

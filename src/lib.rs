@@ -8,6 +8,7 @@ pub mod processor;
 pub mod slab_types;
 pub mod slab_types_v16;
 pub mod state;
+pub mod state_v16;
 pub mod token2022;
 pub mod transfer_hook;
 pub mod valuation;
