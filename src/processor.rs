@@ -14,13 +14,14 @@ use solana_program::{
 };
 
 use crate::{
-    cpi::{read_position, verify_slab_owner, PERCOLATOR_DEVNET, PERCOLATOR_MAINNET},
+    cpi_v16,
     error::NftError,
     instruction::NftInstruction,
-    state::{
-        mint_authority_pda, position_nft_pda, verify_pda_version, PositionNft,
-        MINT_AUTHORITY_SEED, POSITION_NFT_LEN, POSITION_NFT_MAGIC, POSITION_NFT_SEED,
-        POSITION_NFT_VERSION,
+    slab_types_v16,
+    state_v16::{
+        mint_authority_pda, position_nft_pda, verify_position_nft, PositionNftV16,
+        MINT_AUTHORITY_SEED, POSITION_NFT_V16_LEN, POSITION_NFT_V16_MAGIC,
+        POSITION_NFT_V16_VERSION, POSITION_NFT_SEED,
     },
     token2022,
     transfer_hook::{extra_account_metas_pda, EXECUTE_DISCRIMINATOR, EXTRA_METAS_SEED},
@@ -30,8 +31,8 @@ use crate::{
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let ix = NftInstruction::unpack(data)?;
     match ix {
-        NftInstruction::MintPositionNft { user_idx } => {
-            process_mint_position_nft(program_id, accounts, user_idx)
+        NftInstruction::MintPositionNft { asset_index } => {
+            process_mint_position_nft(program_id, accounts, asset_index)
         }
         NftInstruction::BurnPositionNft => process_burn_position_nft(program_id, accounts),
         NftInstruction::SettleFunding => process_settle_funding(program_id, accounts),
@@ -51,27 +52,14 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 // ═══════════════════════════════════════════════════════════════
 
 /// Token-2022 Mint account base size (without extensions).
-/// Token-2022 pads the 82-byte Mint struct to 165 bytes (same as token accounts)
-/// before the AccountType discriminator and TLV extensions. Using 82 causes
-/// InitializeMint2 to fail with InvalidAccountData because the TLV area
-/// overlaps with the padded mint region.
 const MINT_BASE_SIZE: u64 = 165;
-/// PERC-9057: AccountType discriminator byte between base Mint data and TLV extensions.
-/// Token-2022 writes this 1-byte discriminator (value 1 for Mint) at offset 82.
-/// Previously omitted — worked because METADATA_MAX_LEN was a gross overestimate,
-/// absorbing the 1-byte shortfall. Without this, tightening METADATA_MAX_LEN to
-/// actual usage would cause MintPositionNft to fail.
+/// AccountType discriminator byte between base Mint data and TLV extensions.
 const ACCOUNT_TYPE_SIZE: u64 = 1;
-/// Type/length header for metadata extension.
-const METADATA_EXTENSION_HEADER: u64 = 4; // type(2) + length(2)
-/// Rough upper bound for metadata content (name + symbol + uri + fields).
-/// Actual size computed per-mint based on market symbol length.
-const METADATA_MAX_LEN: u64 = 512;
 
 fn process_mint_position_nft(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    user_idx: u16,
+    asset_index: u16,
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
@@ -79,18 +67,14 @@ fn process_mint_position_nft(
     let nft_pda = next_account_info(accounts_iter)?; // 1: PositionNft PDA (writable)
     let nft_mint = next_account_info(accounts_iter)?; // 2: NFT mint (writable, Token-2022)
     let owner_ata = next_account_info(accounts_iter)?; // 3: Owner's ATA (writable)
-    let slab = next_account_info(accounts_iter)?; // 4: Slab account (read-only)
+    let portfolio = next_account_info(accounts_iter)?; // 4: Portfolio account (writable — future B-3 CPI mutates it)
     let mint_auth = next_account_info(accounts_iter)?; // 5: Mint authority PDA
     let token_program = next_account_info(accounts_iter)?; // 6: Token-2022 program
     let ata_program = next_account_info(accounts_iter)?; // 7: ATA program
     let system_program = next_account_info(accounts_iter)?; // 8: System program
     let extra_metas = next_account_info(accounts_iter)?; // 9: ExtraAccountMetaList PDA (writable, created)
 
-    // ── PERC-9004: Verify well-known program account keys ──
-    // Without these checks, an attacker can substitute malicious programs for
-    // Token-2022, ATA, or System program. While the downstream CPIs would
-    // likely fail with the wrong program, checking upfront is defence-in-depth
-    // and produces clearer error messages.
+    // ── Verify well-known program account keys ──
     if *token_program.key != token2022::TOKEN_2022_PROGRAM_ID {
         msg!("MintPositionNft: invalid Token-2022 program key");
         return Err(ProgramError::IncorrectProgramId);
@@ -109,7 +93,7 @@ fn process_mint_position_nft(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // ── 3D.1e: Verify writable accounts are actually writable ──
+    // ── Verify writable accounts are actually writable ──
     if !nft_pda.is_writable {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -120,36 +104,31 @@ fn process_mint_position_nft(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // ── Verify slab ownership ──
-    verify_slab_owner(slab)?;
+    // ── Verify portfolio ownership (fail-closed allowlist) ──
+    cpi_v16::verify_portfolio_program(portfolio)?;
 
-    // ── Read position from slab ──
-    let slab_data = slab.try_borrow_data()?;
-    let position = read_position(&slab_data, user_idx)?;
-    drop(slab_data);
+    // ── Decode portfolio and check mint eligibility ──
+    let portfolio_data = portfolio.try_borrow_data()?;
+    let p =
+        slab_types_v16::decode_portfolio(&portfolio_data).map_err(cpi_v16::map_decode_err)?;
 
-    // ── Verify caller owns this position ──
-    // PERC-9049: Don't log expected/actual pubkeys — leaks account relationships
-    // to transaction log readers who can use this for targeted attacks.
-    if position.owner != *owner.key {
-        msg!("MintPositionNft: position owner mismatch");
-        return Err(ProgramError::InvalidAccountData);
-    }
+    let slot = cpi_v16::mint_leg_slot(p, &owner.key.to_bytes(), asset_index as u32)
+        .map_err(ProgramError::from)?;
 
-    // ── Verify position is open ──
-    if position.size == 0 {
-        return Err(NftError::PositionNotOpen.into());
-    }
-
-    // ── Verify account is a User account, not an LP account ──
-    // kind=0: User (trader), kind=1: LP (liquidity provider)
-    // Only trading accounts should be wrapped as NFTs.
-    if position.kind != 0 {
-        return Err(NftError::LpAccountNotAllowed.into());
-    }
+    let leg = &p.legs[slot];
+    // Snapshot all leg fields needed before dropping the borrow.
+    let snap_side = leg.side;
+    let snap_basis_pos_q = leg.basis_pos_q.get();
+    let snap_f_snap = leg.f_snap.get();
+    let snap_market_id = leg.market_id.get();
+    let snap_epoch_snap = leg.epoch_snap.get();
+    let snap_owner = p.owner();
+    // The percolator program id is the wrapper that OWNS the portfolio account.
+    let percolator_prog_id: Pubkey = *portfolio.owner;
+    drop(portfolio_data);
 
     // ── Verify PDA derivation ──
-    let (expected_pda, bump) = position_nft_pda(slab.key, user_idx, program_id);
+    let (expected_pda, bump) = position_nft_pda(portfolio.key, asset_index, program_id);
     if *nft_pda.key != expected_pda {
         return Err(NftError::InvalidNftPda.into());
     }
@@ -159,16 +138,13 @@ fn process_mint_position_nft(
         return Err(NftError::NftAlreadyMinted.into());
     }
 
-    // ── PERC-9028: Verify nft_mint is a signer ──
-    // nft_mint is a caller-supplied keypair that must sign the transaction
-    // (required by create_account). Checking upfront gives a clear error
-    // instead of a confusing system program failure message.
+    // ── Verify nft_mint is a signer ──
     if !nft_mint.is_signer {
         msg!("MintPositionNft: nft_mint must be a signer");
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // ── GH#7: Verify nft_mint is a fresh, uninitialized account ──
+    // ── Verify nft_mint is a fresh, uninitialized account ──
     if nft_mint.lamports() != 0 || !nft_mint.data_is_empty() {
         msg!("MintPositionNft: nft_mint account is not a fresh keypair (already funded or initialized)");
         return Err(NftError::NftAlreadyMinted.into());
@@ -180,12 +156,7 @@ fn process_mint_position_nft(
         return Err(NftError::InvalidMintAuthority.into());
     }
 
-    // ── PERC-9024: Verify owner_ata matches ATA derivation ──
-    // Re-derive the expected ATA from (owner, nft_mint) and verify it matches
-    // the passed owner_ata. Without this, an attacker can supply an arbitrary
-    // token account as owner_ata — the mint CPI would succeed into a different
-    // account, allowing them to claim ownership of the NFT without holding the
-    // canonical ATA.
+    // ── Verify owner_ata matches ATA derivation ──
     let expected_ata = token2022::get_associated_token_address(owner.key, nft_mint.key);
     if *owner_ata.key != expected_ata {
         msg!("MintPositionNft: owner_ata does not match expected ATA derivation");
@@ -194,11 +165,11 @@ fn process_mint_position_nft(
 
     // ── Create PositionNft PDA account ──
     let rent = Rent::get()?;
-    let lamports = rent.minimum_balance(POSITION_NFT_LEN);
+    let lamports = rent.minimum_balance(POSITION_NFT_V16_LEN);
     let pda_seeds: &[&[u8]] = &[
         POSITION_NFT_SEED,
-        slab.key.as_ref(),
-        &user_idx.to_le_bytes(),
+        portfolio.key.as_ref(),
+        &asset_index.to_le_bytes(),
         &[bump],
     ];
 
@@ -207,82 +178,52 @@ fn process_mint_position_nft(
             owner.key,
             nft_pda.key,
             lamports,
-            POSITION_NFT_LEN as u64,
+            POSITION_NFT_V16_LEN as u64,
             program_id,
         ),
         &[owner.clone(), nft_pda.clone(), system_program.clone()],
         &[pda_seeds],
     )?;
 
-    // ── Initialize PositionNft state ──
+    // ── Initialize PositionNftV16 state ──
     let clock = solana_program::clock::Clock::get()?;
     let mut pda_data = nft_pda.try_borrow_mut_data()?;
-    let nft_state = bytemuck::from_bytes_mut::<PositionNft>(&mut pda_data[..POSITION_NFT_LEN]);
-    nft_state.magic = POSITION_NFT_MAGIC;
-    nft_state.version = POSITION_NFT_VERSION;
+    let nft_state =
+        bytemuck::from_bytes_mut::<PositionNftV16>(&mut pda_data[..POSITION_NFT_V16_LEN]);
+    nft_state.magic = slab_types_v16::V16PodU64::new(POSITION_NFT_V16_MAGIC);
+    nft_state.version = POSITION_NFT_V16_VERSION;
     nft_state.bump = bump;
-    nft_state.slab = slab.key.to_bytes();
-    nft_state.user_idx = user_idx;
+    nft_state.portfolio_account = portfolio.key.to_bytes();
     nft_state.nft_mint = nft_mint.key.to_bytes();
-    nft_state.account_id = position.account_id;
-    // PERC-N1: record the 32-byte position owner pubkey for v12.17 slot-reuse detection.
-    // On v12.17 slabs `account_id` is always 0; `position_owner` is the live discriminator.
-    nft_state.position_owner = position.owner.to_bytes();
-    nft_state.entry_price_e6 = position.entry_price_e6;
-    nft_state.position_size = position.size;
-    nft_state.is_long = position.is_long;
-    nft_state.position_basis_q = position.position_basis_q;
-    nft_state.last_funding_index_e18 = position.global_funding_index_e18;
-    nft_state.minted_at = clock.unix_timestamp;
+    nft_state.asset_index = slab_types_v16::V16PodU32::new(asset_index as u32);
+    nft_state.side_at_mint = snap_side;
+    nft_state.basis_pos_q_at_mint = slab_types_v16::V16PodI128::new(snap_basis_pos_q);
+    nft_state.f_snap_at_mint = slab_types_v16::V16PodI128::new(snap_f_snap);
+    nft_state.market_id_at_mint = slab_types_v16::V16PodU64::new(snap_market_id);
+    nft_state.epoch_snap_at_mint = slab_types_v16::V16PodU64::new(snap_epoch_snap);
+    nft_state.position_owner_at_mint = snap_owner;
+    nft_state.minted_at = slab_types_v16::V16PodI64::new(clock.unix_timestamp);
     drop(pda_data);
 
     // ── Build metadata strings ──
-    let direction = if position.is_long == 1 {
-        "LONG"
-    } else {
-        "SHORT"
-    };
-    // Name: "Percolator Position — LONG/SHORT" (self-descriptive, immutable)
+    let direction = if snap_side == 0 { "LONG" } else { "SHORT" };
     let nft_name = alloc::format!("Percolator Position \u{2014} {}", direction);
-    // PERC-9056: Use a constant symbol instead of direction-dependent format!().
-    // "PERC-POS" is stable across transfers; direction is encoded in nft_name.
     const NFT_SYMBOL: &str = "PERC-POS";
-
-
-    // URI: Empty — all position data is on-chain in PositionNft PDA
     let nft_uri = "";
 
-    // ── Create Token-2022 mint account (with metadata pointer + metadata + transfer hook extensions) ──
-    // Allocate space for base mint + account type + 3 pre-InitializeMint2 extensions ONLY.
-    // Metadata space is NOT included here — Token-2022 rejects InitializeMint2 if
-    // uninitialized TLV data follows the 3 valid extensions (parses zero-padded
-    // bytes as invalid extension type). Metadata will be added via
-    // initialize_token_metadata which auto-reallocs the account.
-    // Token-2022 InitializeMint2 requires EXACTLY getMintLen(extensions) bytes.
-    // getMintLen([MetadataPointer, TransferHook, CloseAuth]) = 338.
-    // Metadata is a variable-length extension — Token-2022's initialize_token_metadata
-    // calls realloc() internally to grow the account. But the Solana runtime checks
-    // rent-exemption AFTER the tx. So we create the account at 338 bytes but fund it
-    // with enough lamports for the FINAL size (338 + metadata TLV).
+    // ── Create Token-2022 mint account ──
     let mint_space: u64 = MINT_BASE_SIZE
         + ACCOUNT_TYPE_SIZE
         + token2022::METADATA_POINTER_EXTENSION_SIZE
         + token2022::TRANSFER_HOOK_EXTENSION_SIZE
         + token2022::MINT_CLOSE_AUTHORITY_EXTENSION_SIZE;
-    // Compute final size after metadata realloc for rent calculation
-    // Metadata TLV: type(2) + len(2) + update_authority(32) + mint(32)
-    // + name(4+len) + symbol(4+len) + uri(4+len) + additional_metadata(4, empty vec)
-    // Add 128 bytes safety buffer for Token-2022 internal padding/alignment.
     let metadata_tlv_size: usize = {
         let name_len = 4 + nft_name.len();
         let symbol_len = 4 + NFT_SYMBOL.len();
         let uri_len = 4 + nft_uri.len();
-        4 + 32 + 32 + name_len + symbol_len + uri_len + 4 // +4 for empty additional_metadata vec
+        4 + 32 + 32 + name_len + symbol_len + uri_len + 4
     };
     let final_size = mint_space as usize + metadata_tlv_size + 128;
-    // Fund with rent for final_size (post-metadata-realloc) but allocate only mint_space.
-    // Token-2022 initialize_token_metadata will realloc the account larger, and the
-    // Solana runtime checks rent-exemption at the FINAL size after tx completes.
     let mint_rent = rent.minimum_balance(final_size);
     invoke(
         &system_instruction::create_account(
@@ -295,40 +236,26 @@ fn process_mint_position_nft(
         &[owner.clone(), nft_mint.clone(), system_program.clone()],
     )?;
 
-    // PERC-9061: Initialize MetadataPointer extension BEFORE InitializeMint2.
-    // This tells wallets/explorers where to find the embedded metadata via standard
-    // Token-2022 metadata discovery. Without it, metadata is stored but invisible.
-    // Self-referencing: metadata_address = mint itself (embedded metadata).
     invoke(
         &token2022::initialize_metadata_pointer(nft_mint.key, mint_auth.key, nft_mint.key),
         std::slice::from_ref(nft_mint),
     )?;
 
-    // Initialize TransferHook extension BEFORE InitializeMint2.
-    // Our program is the transfer hook — Token-2022 will call us on every transfer.
     invoke(
         &token2022::initialize_transfer_hook(nft_mint.key, mint_auth.key, program_id),
         std::slice::from_ref(nft_mint),
     )?;
 
-    // PERC-9060: Initialize MintCloseAuthority extension BEFORE InitializeMint2.
-    // This allows the burn handler to close the mint account and reclaim rent.
-    // Without this extension, Token-2022 rejects CloseAccount on mint accounts.
     invoke(
         &token2022::initialize_mint_close_authority(nft_mint.key, mint_auth.key),
         std::slice::from_ref(nft_mint),
     )?;
 
-    // InitializeMint2 (decimals=0, authority=mint_auth PDA, no freeze)
     invoke(
         &token2022::initialize_mint2(nft_mint.key, mint_auth.key),
         std::slice::from_ref(nft_mint),
     )?;
 
-    // ── Initialize metadata extension ──
-    // Token-2022 alloc_and_serialize_variable_len_extension handles realloc internally.
-    // The mint was overfunded at create_account time (rent for final_size) so
-    // the runtime rent-exemption check passes after Token-2022 grows the account.
     let mint_auth_seeds: &[&[u8]] = &[MINT_AUTHORITY_SEED, &[mint_auth_bump]];
     invoke_signed(
         &token2022::initialize_token_metadata(
@@ -343,10 +270,7 @@ fn process_mint_position_nft(
         &[mint_auth_seeds],
     )?;
 
-    // ── PERC-9024: Verify owner_ata matches expected ATA derivation ──
-    // Without this, a caller can pass an arbitrary account as owner_ata.
-    // The ATA program CPI would create the correct ATA anyway, but if the
-    // passed account doesn't match, the mint CPI could target the wrong account.
+    // ── Re-check owner_ata derivation ──
     let expected_ata = token2022::get_associated_token_address(owner.key, nft_mint.key);
     if *owner_ata.key != expected_ata {
         msg!("MintPositionNft: owner_ata does not match expected ATA derivation");
@@ -374,10 +298,7 @@ fn process_mint_position_nft(
         &[mint_auth_seeds],
     )?;
 
-    // ── PERC-9058: Revoke mint authority (supply=1 is now immutable) ──
-    // Standard NFT pattern: after minting exactly 1 token, set the mint
-    // authority to None so no additional tokens can ever be minted for this
-    // mint, regardless of any future program logic changes.
+    // ── Revoke mint authority (supply=1 is now immutable) ──
     invoke_signed(
         &token2022::set_mint_authority_none(nft_mint.key, mint_auth.key),
         &[nft_mint.clone(), mint_auth.clone()],
@@ -385,66 +306,28 @@ fn process_mint_position_nft(
     )?;
 
     // ════════════════════════════════════════════════════════════════════
-    // PERC-9064: Atomic ExtraAccountMetaList PDA initialization
+    // Atomic ExtraAccountMetaList PDA initialization
     //
-    // Token-2022's TransferHook extension calls our `process_execute` on
-    // every NFT transfer. Before invoking the hook, Token-2022 reads the
-    // `ExtraAccountMetaList` PDA at `[b"extra-account-metas", mint]` to
-    // discover the extra accounts the hook requires. If that PDA is absent
-    // or not owned by this program, `process_execute` rejects with
-    // `InvalidExtraAccountMetas` and the NFT is non-transferable.
-    //
-    // We create and initialize the PDA here, inline, so every minted NFT
-    // is born transferable — no separate instruction to chain on the
-    // client side, no race window.
-    //
-    // TLV layout (byte-for-byte matches upstream
-    // `spl_tlv_account_resolution::state::ExtraAccountMetaList`
-    // `::init::<ExecuteInstruction>`):
-    //
-    //   bytes  [0..8]   : EXECUTE_DISCRIMINATOR (TLV type, 8 bytes)
-    //   bytes  [8..12]  : u32 LE — TLV value length = 4 + 35 * N (179 for N=5)
-    //   bytes  [12..16] : u32 LE — number of entries (5)
-    //   bytes  [16..16+35*N] : N × 35-byte ExtraAccountMeta entries:
-    //                            [0]      : discriminator (0 = Fixed/Literal pubkey)
-    //                            [1..33]  : 32-byte raw pubkey
-    //                            [33]     : is_signer (u8, 0 or 1)
-    //                            [34]     : is_writable (u8, 0 or 1)
-    //
-    // For N=5 fixed-pubkey entries, total account size = 16 + 175 = 191 bytes.
-    //
-    // The 5 entries correspond to `process_execute` extra account indices 5-9:
-    //   [5] PositionNft PDA      — writable  (hook updates last_funding_index_e18)
-    //   [6] Slab account         — read-only
-    //   [7] Percolator program   — read-only (value from slab.owner, see below)
+    // TLV layout (6 entries):
+    //   [5] PositionNft PDA      — writable  (hook updates f_snap_at_mint)
+    //   [6] Portfolio account    — WRITABLE  (future B-3 CPI mutates it)
+    //   [7] Percolator program   — read-only (from portfolio.owner, allowlist-verified)
     //   [8] Mint authority PDA   — read-only
-    //   [9] Instructions sysvar  — read-only (for CPI caller verification)
-    //
-    // Percolator program key: taken from `*slab.owner`, which is verified
-    // by `verify_slab_owner` at line 106 to be either PERCOLATOR_DEVNET or
-    // PERCOLATOR_MAINNET — exactly the allow-list `process_execute` enforces
-    // at account index 7. Using slab.owner avoids adding an extra account
-    // to the MintPositionNft ABI.
+    //   [9] Instructions sysvar  — read-only
+    //  [10] NFT program (self)   — read-only
+    // ════════════════════════════════════════════════════════════════════
     {
-        // Re-assert the slab-owner invariant LOCALLY so the TLV block's
-        // security guarantee is refactor-proof: if a future edit moves the
-        // extra_metas block above the top-of-handler verify_slab_owner,
-        // this re-assertion still enforces the allow-list before any
-        // percolator_prog bytes are written into the validation account.
-        verify_slab_owner(slab)?;
-        // SAFETY: verify_slab_owner above guarantees slab.owner is one of
-        // {PERCOLATOR_DEVNET, PERCOLATOR_MAINNET}. Recording this pubkey
-        // in the ExtraAccountMetaList means every subsequent transfer hook
-        // invocation will see it at extra account index 7, matching the
-        // allow-list check already enforced in process_execute.
-        let percolator_prog_id: Pubkey = *slab.owner;
+        // Re-assert portfolio ownership so this block's security guarantee is
+        // refactor-proof: if a future edit moves this block above the top-of-handler
+        // verify_portfolio_program, this re-assertion still enforces the allowlist.
+        cpi_v16::verify_portfolio_program(portfolio)?;
+        // SAFETY: verify_portfolio_program above guarantees portfolio.owner is one of
+        // {PERCOLATOR_DEVNET, PERCOLATOR_MAINNET}.
         debug_assert!(
-            percolator_prog_id == PERCOLATOR_DEVNET
-                || percolator_prog_id == PERCOLATOR_MAINNET
+            percolator_prog_id == cpi_v16::PERCOLATOR_DEVNET
+                || percolator_prog_id == cpi_v16::PERCOLATOR_MAINNET
         );
 
-        // Derive the canonical ExtraAccountMetaList PDA and verify the
-        // caller passed the correct account.
         let (expected_extra_metas, extra_metas_bump) =
             extra_account_metas_pda(nft_mint.key, program_id);
         if *extra_metas.key != expected_extra_metas {
@@ -452,22 +335,12 @@ fn process_mint_position_nft(
             return Err(NftError::InvalidExtraAccountMetas.into());
         }
 
-        // Reject re-initialization. Because `nft_mint` is enforced to be
-        // a fresh keypair earlier in this handler (line 153), the PDA
-        // derived from its key should always be empty. This check is
-        // defense-in-depth against any future path that might reuse a
-        // mint keypair.
         if extra_metas.owner == program_id && !extra_metas.data_is_empty() {
             msg!("MintPositionNft: extra_metas PDA already initialized");
             return Err(NftError::InvalidExtraAccountMetas.into());
         }
 
-        // TLV account size constants.
         const EXTRA_META_ENTRY_LEN: usize = 35;
-        // 6 entries: nft_pda, slab, percolator_prog, mint_auth, sysvar_ix, nft_program (self).
-        // The NFT program is listed so its AccountInfo is available in
-        // process_execute and can be forwarded as the 3rd account_info to
-        // invoke_signed when CPIing into percolator-prog (see PERC-9070).
         const EXTRA_META_COUNT: usize = 6;
         const EXTRA_METAS_ACCOUNT_LEN: usize =
             8 /* TLV type */ + 4 /* TLV length */ + 4 /* entry count */
@@ -479,12 +352,6 @@ fn process_mint_position_nft(
             &[extra_metas_bump],
         ];
 
-        // Grief-resistant creation: system_instruction::create_account fails
-        // if the destination already has lamports (a 1-lamport airdrop on
-        // the deterministic PDA address would permanently brick this mint).
-        // Instead, we transfer the rent shortfall from the payer (if any),
-        // then allocate and assign via signed CPIs. This sequence succeeds
-        // regardless of any pre-existing lamport balance.
         let extra_metas_rent = rent.minimum_balance(EXTRA_METAS_ACCOUNT_LEN);
         let current_lamports = extra_metas.lamports();
         if current_lamports < extra_metas_rent {
@@ -508,52 +375,30 @@ fn process_mint_position_nft(
             &[extra_metas_seeds],
         )?;
 
-        // Write the TLV-encoded validation data.
         let mut data = extra_metas.try_borrow_mut_data()?;
         if data.len() != EXTRA_METAS_ACCOUNT_LEN {
             return Err(ProgramError::AccountDataTooSmall);
         }
 
-        // [0..8] TLV type discriminator = ExecuteInstruction's SplDiscriminate
-        //        = sha256("spl-transfer-hook-interface:execute")[..8]
-        //        (same constant the hook already uses to detect its
-        //        top-level Execute instruction).
         data[0..8].copy_from_slice(&EXECUTE_DISCRIMINATOR);
 
-        // [8..12] u32 LE — TLV value length = entry_count(4) + entries(N*35)
         let tlv_value_len: u32 =
             (4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT) as u32;
         data[8..12].copy_from_slice(&tlv_value_len.to_le_bytes());
-
-        // [12..16] u32 LE — number of entries
         data[12..16].copy_from_slice(&(EXTRA_META_COUNT as u32).to_le_bytes());
 
-        // [16..] 35 bytes per entry, in order matching process_execute:
-        //   [disc(1) = 0 (FixedPubkey) | pubkey(32) | is_signer(1) | is_writable(1)]
         let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
-            // 5: PositionNft PDA — writable (updated during transfer)
+            // 5: PositionNft PDA — writable (hook updates f_snap_at_mint on transfer)
             (*nft_pda.key, false, true),
-            // 6: Slab — writable. The transfer hook CPIs into
-            // percolator-prog with TransferOwnershipCpi (tag 69) which
-            // mutates Account.owner in the slab. If this is declared
-            // read-only, the CPI fails with "writable privilege
-            // escalated". Historical NFTs minted before this fix have
-            // the slab declared read-only in their ExtraAccountMetaList
-            // and are un-transferrable until `repair_extra_metas`
-            // (tag 6) is called against their mint.
-            (*slab.key, false, true),
-            // 7: Percolator program — read-only, from verified slab.owner
+            // 6: Portfolio account — WRITABLE (B-3 CPI will mutate portfolio.owner)
+            (*portfolio.key, false, true),
+            // 7: Percolator program — read-only, from verified portfolio.owner
             (percolator_prog_id, false, false),
             // 8: Mint authority PDA — read-only
             (*mint_auth.key, false, false),
             // 9: Instructions sysvar — read-only
             (sysvar_instructions::id(), false, false),
-            // 10: NFT program (self) — read-only. Listed so its AccountInfo
-            // arrives in process_execute and can be forwarded to
-            // invoke_signed when CPIing into percolator-prog. Without this,
-            // the CPI fails with NotEnoughAccountKeys because the runtime
-            // cannot resolve the program-id account meta from an
-            // account_infos slice that does not contain it.
+            // 10: NFT program (self) — read-only
             (*program_id, false, false),
         ];
 
@@ -567,9 +412,9 @@ fn process_mint_position_nft(
     }
 
     msg!(
-        "PositionNft minted: slab={}, idx={}, mint={}",
-        slab.key,
-        user_idx,
+        "PositionNft minted: portfolio={}, asset_index={}, mint={}",
+        portfolio.key,
+        asset_index,
         nft_mint.key
     );
     Ok(())
@@ -586,7 +431,7 @@ fn process_burn_position_nft(program_id: &Pubkey, accounts: &[AccountInfo]) -> P
     let nft_pda = next_account_info(accounts_iter)?; // 1: PositionNft PDA (writable)
     let nft_mint = next_account_info(accounts_iter)?; // 2: NFT mint (writable)
     let holder_ata = next_account_info(accounts_iter)?; // 3: Holder's ATA (writable)
-    let slab = next_account_info(accounts_iter)?; // 4: Slab (verify)
+    let portfolio = next_account_info(accounts_iter)?; // 4: Portfolio account
     let mint_auth = next_account_info(accounts_iter)?; // 5: Mint authority PDA
     let token_program = next_account_info(accounts_iter)?; // 6: Token-2022
 
@@ -594,7 +439,6 @@ fn process_burn_position_nft(program_id: &Pubkey, accounts: &[AccountInfo]) -> P
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // ── 3D.1e: Verify writable accounts are actually writable ──
     if !nft_pda.is_writable {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -605,144 +449,77 @@ fn process_burn_position_nft(program_id: &Pubkey, accounts: &[AccountInfo]) -> P
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // ── PERC-9003: Verify PDA is owned by this program ──
-    // Without this check an attacker can craft a 208-byte account (owned by
-    // any program) with matching magic/slab/mint bytes and pass it as nft_pda.
-    // The subsequent magic and slab checks alone are insufficient because any
-    // program can write those byte patterns into its own accounts.
+    // ── Verify PDA is owned by this program ──
     if nft_pda.owner != program_id {
         msg!("Burn rejected: PositionNft PDA not owned by this program");
         return Err(ProgramError::IllegalOwner);
     }
 
-    // ── PERC-9005: Verify Token-2022 program key ──
-    // The burn CPI instruction hardcodes TOKEN_2022_PROGRAM_ID, but the
-    // account_infos passed to invoke() must include the actual program.
-    // Without this check an attacker could pass a fake program that accepts
-    // the burn instruction but doesn't actually burn the token.
     if *token_program.key != token2022::TOKEN_2022_PROGRAM_ID {
         msg!("BurnPositionNft: invalid Token-2022 program key");
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // ── PERC-9005: Verify mint authority PDA ──
+    // ── Verify mint authority PDA ──
     let (expected_mint_auth, _) = mint_authority_pda(program_id);
     if *mint_auth.key != expected_mint_auth {
         msg!("BurnPositionNft: invalid mint authority PDA");
         return Err(NftError::InvalidMintAuthority.into());
     }
 
-    // ── Verify PDA state ──
+    // ── Read and validate PositionNftV16 state ──
     let pda_data = nft_pda.try_borrow_data()?;
-    if pda_data.len() < POSITION_NFT_LEN {
+    if pda_data.len() < POSITION_NFT_V16_LEN {
         return Err(ProgramError::InvalidAccountData);
     }
-    let nft_state = bytemuck::from_bytes::<PositionNft>(&pda_data[..POSITION_NFT_LEN]);
-    if nft_state.magic != POSITION_NFT_MAGIC {
+    let nft_state =
+        bytemuck::from_bytes::<PositionNftV16>(&pda_data[..POSITION_NFT_V16_LEN]);
+    verify_position_nft(nft_state)?;
+    if nft_state.portfolio_account != portfolio.key.to_bytes() {
         return Err(ProgramError::InvalidAccountData);
     }
-    verify_pda_version(nft_state)?;
-    if nft_state.slab != slab.key.to_bytes() {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    // GH#3: Verify the nft_mint account matches the mint recorded in the PDA.
     if nft_state.nft_mint != nft_mint.key.to_bytes() {
         msg!("Burn rejected: nft_mint does not match PDA's recorded mint");
         return Err(NftError::InvalidNftPda.into());
     }
-    let user_idx = nft_state.user_idx;
-    let nft_account_id = nft_state.account_id;
-    // PERC-N1: extract position_owner for slot-reuse check below.
-    let nft_position_owner = nft_state.position_owner;
-    let _ = nft_state;
+    let asset_index_u16 = nft_state.asset_index.get() as u16;
+    // Take a copy for the slot-reuse check below.
+    let nft_state_copy = *nft_state;
     drop(pda_data);
 
-    // ── PERC-9008: Verify PDA address matches expected derivation ──
-    // The code checks magic, slab, and mint inside the PDA data, but never
-    // verifies that nft_pda.key is the canonical PDA for (slab, user_idx).
-    // Without this, any program-owned account with matching fields could be
-    // substituted. The derivation check is the definitive proof of identity.
-    let (expected_pda, _) = position_nft_pda(slab.key, user_idx, program_id);
+    // ── Verify PDA address matches expected derivation ──
+    let (expected_pda, _) =
+        position_nft_pda(portfolio.key, asset_index_u16, program_id);
     if *nft_pda.key != expected_pda {
         msg!("Burn rejected: PDA address does not match expected derivation");
         return Err(NftError::InvalidNftPda.into());
     }
 
-    // GH#1869 (PERC-8222): Verify position has no open trade before burning.
-    // An open-position NFT must not be burned — it would orphan the position
-    // in the slab with no way to recover or manage it.
-    //
-    // PERC-9035: Only check size != 0 (open trade). Residual collateral
-    // (size=0, collateral>0) should NOT block burn. The collateral belongs
-    // to the slab position owner and can only be withdrawn via Percolator
-    // directly — it is unaffected by whether the NFT PDA exists. Requiring
-    // collateral==0 traps the NFT: can't transfer (size=0 fails margin
-    // check), can't burn (collateral>0 fails this check), permanently stuck.
-    //
-    // NOTE (PERC-9060): We intentionally skip the entry_price/is_long mismatch
-    // check here. Percolator zeroes entry_price_e6 when a position is closed, so
-    // comparing against the PDA snapshot would always fail for legitimate burns.
-    // Slot reuse is not a risk — the slot is empty, and burn destroys the PDA.
-    verify_slab_owner(slab)?;
+    // ── v16 slot-reuse check via verify_bound_leg (market_id anchor) ──
+    // v16 Burn semantics: does NOT require position be closed (no size==0 gate).
+    // verify_bound_leg is the gate: LegNotActive means holder must use EmergencyBurn.
+    cpi_v16::verify_portfolio_program(portfolio)?;
     {
-        let slab_data = slab.try_borrow_data()?;
-        let position = read_position(&slab_data, user_idx)?;
-        // Verify account_id matches — if mismatch, the slot was reallocated to a different account
-        if position.account_id != nft_account_id {
-            msg!(
-                "Burn rejected: account_id mismatch (stored={}, current={})",
-                nft_account_id,
-                position.account_id,
-            );
-            return Err(NftError::InvalidAccountId.into());
-        }
-        // PERC-N1: v12.17 slot-reuse bypass fix — verify position owner has not changed.
-        // On v12.17 slabs `account_id` is always 0 so the check above is dead.
-        // `position_owner` is set at mint time and is the live slot-reuse identifier.
-        // MIGRATION GUARD: skip if position_owner == [0u8; 32] (pre-fix NFT minted before
-        // this commit). Tagged remove-after-devnet-wipe.
-        if nft_position_owner != [0u8; 32]
-            && position.owner.to_bytes() != nft_position_owner
-        {
-            msg!("Burn rejected: position owner changed — slot reuse detected (PERC-N1)");
-            return Err(NftError::SlotReused.into());
-        }
-        // PERC-9035: Only block burn on open trade (size != 0). Residual collateral is fine.
-        if position.size != 0 {
-            msg!(
-                "Burn rejected: position still has open trade (size={})",
-                position.size,
-            );
-            return Err(NftError::PositionNotClosed.into());
-        }
+        let portfolio_data = portfolio.try_borrow_data()?;
+        let p = slab_types_v16::decode_portfolio(&portfolio_data)
+            .map_err(cpi_v16::map_decode_err)?;
+        let _slot = cpi_v16::verify_bound_leg(p, &nft_state_copy)
+            .map_err(ProgramError::from)?;
     }
 
-    // ── Verify holder owns the NFT (check ATA balance) ──
-    // GH#15 / GH#16: Verify holder_ata is owned by Token-2022 program before
-    // reading raw bytes. Mirrors GH#14 fix applied to process_settle_funding().
-    // Without this, a crafted 72-byte account could satisfy the balance/owner/
-    // mint byte-offset checks; the burn CPI would reject it, but this adds
-    // defense-in-depth and consistency across all instructions.
+    // ── Verify holder owns the NFT (ATA balance check) ──
     if *holder_ata.owner != token2022::TOKEN_2022_PROGRAM_ID {
         return Err(NftError::NotNftHolder.into());
     }
     let ata_data = holder_ata.try_borrow_data()?;
-    // Token-2022 account layout (165 bytes, same offsets as SPL Token):
-    //   [32..64]  owner (Pubkey)
-    //   [64..72]  amount (u64 LE)
-    //   [108]     state (u8: 0=uninit, 1=initialized, 2=frozen)
     if ata_data.len() < 165 {
         return Err(NftError::NotNftHolder.into());
     }
     let amount = u64::from_le_bytes(ata_data[64..72].try_into().unwrap());
     let ata_owner = Pubkey::new_from_array(ata_data[32..64].try_into().unwrap());
-    // PERC-9007: Read ATA mint field [0..32] and verify it matches the NFT mint.
-    // Without this, an attacker who holds ANY Token-2022 token with balance=1
-    // could pass that ATA instead of the real NFT ATA, passing the balance and
-    // owner checks while burning a completely different token.
     let ata_mint = Pubkey::new_from_array(ata_data[0..32].try_into().unwrap());
-    // Verify account is initialized using pinocchio-token AccountState discriminants.
-    let ata_initialized = ata_data[108] == pinocchio_token::state::AccountState::Initialized as u8;
+    let ata_initialized =
+        ata_data[108] == pinocchio_token::state::AccountState::Initialized as u8;
     drop(ata_data);
 
     if !ata_initialized {
@@ -759,25 +536,31 @@ fn process_burn_position_nft(program_id: &Pubkey, accounts: &[AccountInfo]) -> P
     // ── Burn the NFT ──
     invoke(
         &token2022::burn(holder_ata.key, nft_mint.key, holder.key, 1),
-        &[holder_ata.clone(), nft_mint.clone(), holder.clone(), token_program.clone()],
+        &[
+            holder_ata.clone(),
+            nft_mint.clone(),
+            holder.clone(),
+            token_program.clone(),
+        ],
     )?;
 
-    // ���─ PERC-9032: Close the ATA (return rent to holder) ──
-    // Without this, the empty ATA remains open with ~0.002 SOL locked.
+    // ── Close the ATA (return rent to holder) ──
     invoke(
         &token2022::close_account(holder_ata.key, holder.key, holder.key),
         &[holder_ata.clone(), holder.clone(), token_program.clone()],
     )?;
 
-    // ── PERC-9060: Close the mint account (return rent to holder) ──
-    // Supply is now 0 after burn. The MintCloseAuthority extension designates
-    // mint_auth PDA as the close authority, allowing us to reclaim ~0.003-0.005 SOL.
-    // Without this, mint rent is permanently locked per NFT lifecycle.
+    // ── Close the mint account (return rent to holder) ──
     let (_, mint_auth_bump) = mint_authority_pda(program_id);
     let mint_auth_seeds: &[&[u8]] = &[MINT_AUTHORITY_SEED, &[mint_auth_bump]];
     invoke_signed(
         &token2022::close_account(nft_mint.key, holder.key, mint_auth.key),
-        &[nft_mint.clone(), holder.clone(), mint_auth.clone(), token_program.clone()],
+        &[
+            nft_mint.clone(),
+            holder.clone(),
+            mint_auth.clone(),
+            token_program.clone(),
+        ],
         &[mint_auth_seeds],
     )?;
 
@@ -792,7 +575,11 @@ fn process_burn_position_nft(program_id: &Pubkey, accounts: &[AccountInfo]) -> P
     let mut pda_data = nft_pda.try_borrow_mut_data()?;
     pda_data.fill(0);
 
-    msg!("PositionNft burned: slab={}, idx={}", slab.key, user_idx);
+    msg!(
+        "PositionNft burned: portfolio={}, asset_index={}",
+        portfolio.key,
+        asset_index_u16
+    );
     Ok(())
 }
 
@@ -807,7 +594,7 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
     let nft_pda = next_account_info(accounts_iter)?; // 1: PositionNft PDA (writable)
     let nft_mint = next_account_info(accounts_iter)?; // 2: NFT mint (writable)
     let holder_ata = next_account_info(accounts_iter)?; // 3: Holder's ATA (writable)
-    let slab = next_account_info(accounts_iter)?; // 4: Slab (verify liquidation)
+    let portfolio = next_account_info(accounts_iter)?; // 4: Portfolio account
     let mint_auth = next_account_info(accounts_iter)?; // 5: Mint authority PDA
     let token_program = next_account_info(accounts_iter)?; // 6: Token-2022
 
@@ -815,21 +602,16 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // ── 3D.1d: Validate token_program key ──
     if *token_program.key != token2022::TOKEN_2022_PROGRAM_ID {
         msg!("EmergencyBurn: invalid Token-2022 program key");
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // ── 3D.1a: Verify PDA is owned by this program ──
-    // Without this an attacker can craft a matching-magic account owned by a
-    // different program and pass it as nft_pda to bypass all state checks.
     if nft_pda.owner != program_id {
         msg!("EmergencyBurn rejected: PositionNft PDA not owned by this program");
         return Err(ProgramError::IllegalOwner);
     }
 
-    // ── 3D.1e: Verify writable accounts are actually writable ──
     if !nft_pda.is_writable {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -847,64 +629,45 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
         return Err(NftError::InvalidMintAuthority.into());
     }
 
-    // ── Verify PDA state ──
-    let (user_idx, nft_account_id_em, nft_mint_bytes_em) = {
+    // ── Read and validate PositionNftV16 state ──
+    let (asset_index_u16, nft_mint_bytes, nft_state_copy) = {
         let pda_data = nft_pda.try_borrow_data()?;
-        if pda_data.len() < POSITION_NFT_LEN {
+        if pda_data.len() < POSITION_NFT_V16_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
-        let nft_state = bytemuck::from_bytes::<PositionNft>(&pda_data[..POSITION_NFT_LEN]);
-        if nft_state.magic != POSITION_NFT_MAGIC {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        verify_pda_version(nft_state)?;
-        if nft_state.slab != slab.key.to_bytes() {
+        let nft_state =
+            bytemuck::from_bytes::<PositionNftV16>(&pda_data[..POSITION_NFT_V16_LEN]);
+        verify_position_nft(nft_state)?;
+        if nft_state.portfolio_account != portfolio.key.to_bytes() {
             return Err(ProgramError::InvalidAccountData);
         }
         if nft_state.nft_mint != nft_mint.key.to_bytes() {
             msg!("EmergencyBurn rejected: nft_mint does not match PDA's recorded mint");
             return Err(NftError::InvalidNftPda.into());
         }
-        (nft_state.user_idx, nft_state.account_id, nft_state.nft_mint)
-        // pda_data Ref dropped here
+        (
+            nft_state.asset_index.get() as u16,
+            nft_state.nft_mint,
+            *nft_state,
+        )
     };
 
-    // ── 3D.1b: Verify PDA address matches expected derivation ──
-    // Even if magic/slab/mint fields match, any program-owned account at an
-    // arbitrary address could be substituted without this derivation check.
-    let (expected_pda, _) = position_nft_pda(slab.key, user_idx, program_id);
+    // ── Verify PDA address matches expected derivation ──
+    let (expected_pda, _) =
+        position_nft_pda(portfolio.key, asset_index_u16, program_id);
     if *nft_pda.key != expected_pda {
         msg!("EmergencyBurn rejected: PDA address does not match expected derivation");
         return Err(NftError::InvalidNftPda.into());
     }
 
-    // ── Verify position is liquidated (position_basis_q == 0) ──
-    // EmergencyBurn is for positions that have been liquidated on-chain.
-    // BurnPositionNft requires size==0 && collateral==0 (fully closed).
-    // EmergencyBurn requires position_basis_q==0 (liquidated/flat, collateral may remain).
-    verify_slab_owner(slab)?;
+    // ── Check emergency burn eligibility (position flat / no active leg) ──
+    cpi_v16::verify_portfolio_program(portfolio)?;
     {
-        let slab_data = slab.try_borrow_data()?;
-        let position = read_position(&slab_data, user_idx)?;
-
-        // Verify account_id matches
-        if position.account_id != nft_account_id_em {
-            msg!(
-                "EmergencyBurn rejected: account_id mismatch (stored={}, current={})",
-                nft_account_id_em,
-                position.account_id,
-            );
-            return Err(NftError::InvalidAccountId.into());
-        }
-
-        // Position must be flat (liquidated or closed) — position_basis_q == 0
-        if position.position_basis_q != 0 {
-            msg!(
-                "EmergencyBurn rejected: position is still open (position_basis_q={})",
-                position.position_basis_q,
-            );
-            return Err(NftError::PositionNotClosed.into());
-        }
+        let portfolio_data = portfolio.try_borrow_data()?;
+        let p = slab_types_v16::decode_portfolio(&portfolio_data)
+            .map_err(cpi_v16::map_decode_err)?;
+        cpi_v16::emergency_burn_ok(p, &nft_state_copy)
+            .map_err(ProgramError::from)?;
     }
 
     // ── Verify holder owns the NFT ──
@@ -918,32 +681,43 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
     let amount = u64::from_le_bytes(ata_data[64..72].try_into().unwrap());
     let ata_owner = Pubkey::new_from_array(ata_data[32..64].try_into().unwrap());
     let ata_mint = Pubkey::new_from_array(ata_data[0..32].try_into().unwrap());
-    let ata_initialized = ata_data[108] == pinocchio_token::state::AccountState::Initialized as u8;
+    let ata_initialized =
+        ata_data[108] == pinocchio_token::state::AccountState::Initialized as u8;
     drop(ata_data);
 
-    if !ata_initialized || amount != 1 || ata_owner != *holder.key || ata_mint.to_bytes() != nft_mint_bytes_em {
+    if !ata_initialized
+        || amount != 1
+        || ata_owner != *holder.key
+        || ata_mint.to_bytes() != nft_mint_bytes
+    {
         return Err(NftError::NotNftHolder.into());
     }
 
     // ── Burn the NFT ──
-    // 3D.1d: Include token_program in invoke account slice.
     invoke(
         &token2022::burn(holder_ata.key, nft_mint.key, holder.key, 1),
-        &[holder_ata.clone(), nft_mint.clone(), holder.clone(), token_program.clone()],
+        &[
+            holder_ata.clone(),
+            nft_mint.clone(),
+            holder.clone(),
+            token_program.clone(),
+        ],
     )?;
 
-    // ── 3D.1c: Close the ATA (return rent to holder) ──
     invoke(
         &token2022::close_account(holder_ata.key, holder.key, holder.key),
         &[holder_ata.clone(), holder.clone(), token_program.clone()],
     )?;
 
-    // ── 3D.1c: Close the mint account (return rent to holder) ──
-    // The MintCloseAuthority extension designates mint_auth PDA as close authority.
     let mint_auth_seeds: &[&[u8]] = &[MINT_AUTHORITY_SEED, &[mint_auth_bump]];
     invoke_signed(
         &token2022::close_account(nft_mint.key, holder.key, mint_auth.key),
-        &[nft_mint.clone(), holder.clone(), mint_auth.clone(), token_program.clone()],
+        &[
+            nft_mint.clone(),
+            holder.clone(),
+            mint_auth.clone(),
+            token_program.clone(),
+        ],
         &[mint_auth_seeds],
     )?;
 
@@ -958,7 +732,11 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
     let mut pda_data = nft_pda.try_borrow_mut_data()?;
     pda_data.fill(0);
 
-    msg!("PositionNft emergency burned: slab={}, idx={}", slab.key, user_idx);
+    msg!(
+        "PositionNft emergency burned: portfolio={}, asset_index={}",
+        portfolio.key,
+        asset_index_u16
+    );
     Ok(())
 }
 
@@ -966,83 +744,58 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
 // Tag 2: SettleFunding
 // ═══════════════════════════════════════════════════════════════
 
-fn process_settle_funding(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn process_settle_funding(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
-    // GH#5 fix: SettleFunding is now restricted to the current NFT holder.
-    // Previously this was permissionless, allowing any caller to snap the
-    // last_funding_index to the current global value immediately before a
-    // marketplace sale, wiping the seller's accrued funding claim.
-    //
-    // Accounts:
-    //   0. `[signer]`  NFT holder (must own the NFT)
-    //   1. `[writable]` PositionNft PDA
-    //   2. `[]`         Slab account (read funding index)
-    //   3. `[]`         Holder's ATA (proves NFT ownership)
     let holder = next_account_info(accounts_iter)?; // 0: signer — must hold the NFT
     let nft_pda = next_account_info(accounts_iter)?; // 1: PositionNft PDA (writable)
-    let slab = next_account_info(accounts_iter)?; // 2: Slab (read funding index)
+    let portfolio = next_account_info(accounts_iter)?; // 2: Portfolio account
     let holder_ata = next_account_info(accounts_iter)?; // 3: Holder's ATA (verify balance)
 
-    // ── Require holder to sign ──
     if !holder.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // GH#14 fix: Verify holder_ata is owned by Token-2022 program before
-    // trusting its byte layout. Without this, an attacker can pass a crafted
-    // 72-byte account that satisfies the balance/owner/mint checks below.
     if *holder_ata.owner != token2022::TOKEN_2022_PROGRAM_ID {
         return Err(NftError::NotNftHolder.into());
     }
 
-    // ── PERC-9003: Verify PDA is owned by this program ──
-    if nft_pda.owner != _program_id {
+    if nft_pda.owner != program_id {
         msg!("SettleFunding rejected: PositionNft PDA not owned by this program");
         return Err(ProgramError::IllegalOwner);
     }
 
-    verify_slab_owner(slab)?;
+    cpi_v16::verify_portfolio_program(portfolio)?;
 
     let mut pda_data = nft_pda.try_borrow_mut_data()?;
-    if pda_data.len() < POSITION_NFT_LEN {
+    if pda_data.len() < POSITION_NFT_V16_LEN {
         return Err(ProgramError::InvalidAccountData);
     }
-    let nft_state = bytemuck::from_bytes_mut::<PositionNft>(&mut pda_data[..POSITION_NFT_LEN]);
-    if nft_state.magic != POSITION_NFT_MAGIC {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    verify_pda_version(nft_state)?;
-    if nft_state.slab != slab.key.to_bytes() {
+    let nft_state =
+        bytemuck::from_bytes_mut::<PositionNftV16>(&mut pda_data[..POSITION_NFT_V16_LEN]);
+    verify_position_nft(nft_state)?;
+    if nft_state.portfolio_account != portfolio.key.to_bytes() {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // ── PERC-9056: Verify PDA address matches expected derivation ──
-    // Consistency with Mint (line 120) and Burn (line 364, PERC-9008).
-    // Without this, any program-owned account with matching magic/slab fields
-    // could be substituted, allowing funding state manipulation.
-    let (expected_pda, _) = position_nft_pda(slab.key, nft_state.user_idx, _program_id);
+    // ── Verify PDA address matches expected derivation ──
+    let asset_index_u16 = nft_state.asset_index.get() as u16;
+    let (expected_pda, _) = position_nft_pda(portfolio.key, asset_index_u16, program_id);
     if *nft_pda.key != expected_pda {
         msg!("SettleFunding rejected: PDA address does not match expected derivation");
         return Err(NftError::InvalidNftPda.into());
     }
 
-    // ── Verify holder owns the NFT (ATA balance = 1, owner = holder, state = initialized) ──
-    // Token-2022 account layout (165 bytes, same offsets as SPL Token):
-    //   [0..32]  mint (Pubkey)
-    //   [32..64] owner (Pubkey)
-    //   [64..72] amount (u64 LE)
-    //   [108]    state (u8: use pinocchio-token AccountState discriminants)
+    // ── Verify holder owns the NFT ──
     let ata_data = holder_ata.try_borrow_data()?;
     if ata_data.len() < 165 {
         return Err(NftError::NotNftHolder.into());
     }
     let ata_amount = u64::from_le_bytes(ata_data[64..72].try_into().unwrap());
     let ata_owner = Pubkey::new_from_array(ata_data[32..64].try_into().unwrap());
-    // ATA[0..32] = mint address
     let ata_mint = Pubkey::new_from_array(ata_data[0..32].try_into().unwrap());
-    // Verify initialized via pinocchio-token AccountState constant.
-    let ata_initialized = ata_data[108] == pinocchio_token::state::AccountState::Initialized as u8;
+    let ata_initialized =
+        ata_data[108] == pinocchio_token::state::AccountState::Initialized as u8;
     drop(ata_data);
 
     if !ata_initialized {
@@ -1052,69 +805,33 @@ fn process_settle_funding(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Pro
         msg!("SettleFunding: caller does not hold the NFT");
         return Err(NftError::NotNftHolder.into());
     }
-    // Verify the ATA mint matches the NFT PDA's recorded mint.
     if ata_mint.to_bytes() != nft_state.nft_mint {
         msg!("SettleFunding: ATA mint does not match PDA nft_mint");
         return Err(NftError::InvalidNftPda.into());
     }
 
-    let slab_data = slab.try_borrow_data()?;
-    let position = read_position(&slab_data, nft_state.user_idx)?;
+    // Take snapshot of nft_state fields needed for the leg check (cannot hold
+    // nft_state borrow while borrowing portfolio_data since both are mut).
+    let nft_state_copy = *nft_state;
 
-    // Verify account_id matches — if mismatch, the slot was reallocated to a different account
-    if position.account_id != nft_state.account_id {
-        msg!(
-            "SettleFunding rejected: account_id mismatch (stored={}, current={})",
-            nft_state.account_id,
-            position.account_id,
-        );
-        drop(slab_data);
-        return Err(NftError::InvalidAccountId.into());
-    }
+    // ── v16 slot-reuse check + update f_snap ──
+    let portfolio_data = portfolio.try_borrow_data()?;
+    let p = slab_types_v16::decode_portfolio(&portfolio_data)
+        .map_err(cpi_v16::map_decode_err)?;
+    let slot = cpi_v16::verify_bound_leg(p, &nft_state_copy)
+        .map_err(ProgramError::from)?;
 
-    // PERC-N1: v12.17 slot-reuse bypass fix — verify position owner has not changed.
-    // On v12.17 slabs `account_id` is always 0 so the check above is dead.
-    // MIGRATION GUARD: skip if position_owner == [0u8; 32] (pre-fix NFT). Tagged remove-after-devnet-wipe.
-    if nft_state.position_owner != [0u8; 32]
-        && position.owner.to_bytes() != nft_state.position_owner
-    {
-        msg!("SettleFunding rejected: position owner changed — slot reuse detected (PERC-N1)");
-        drop(slab_data);
-        return Err(NftError::SlotReused.into());
-    }
+    // Update f_snap snapshot to current leg value.
+    let new_f_snap = p.legs[slot].f_snap;
+    drop(portfolio_data);
 
-    drop(slab_data);
-
-    // ── PERC-9060: Verify slab slot still matches PDA snapshot ──
-    // If the original position was closed and the slab slot reused for a
-    // different position, entry_price_e6 and/or is_long will differ from
-    // the values snapshotted at mint time. Without this check, the NFT
-    // would settle funding on a completely different position.
-    if nft_state.entry_price_e6 != position.entry_price_e6
-        || nft_state.is_long != position.is_long
-    {
-        msg!(
-            "SettleFunding rejected: slab slot reuse detected (PDA snapshot does not match live position)"
-        );
-        return Err(NftError::PositionMismatch.into());
-    }
-
-    // PERC-9029: Reject settling funding on a closed position (size=0).
-    // A closed position has no active funding accrual. Allowing settle on a
-    // closed position could overwrite the last_funding_index with the current
-    // global value, erasing the funding snapshot from when the position was
-    // still open — misrepresenting historical funding to downstream consumers.
-    if position.size == 0 {
-        msg!("SettleFunding rejected: position is closed (size=0)");
-        return Err(NftError::PositionNotOpen.into());
-    }
-
-    nft_state.last_funding_index_e18 = position.global_funding_index_e18;
+    // Write back — nft_state is still live via pda_data (mut borrow held).
+    nft_state.f_snap_at_mint = new_f_snap;
 
     msg!(
-        "Funding settled: slab={}, idx={}",
-        slab.key,
-        nft_state.user_idx
+        "Funding settled: portfolio={}, asset_index={}",
+        portfolio.key,
+        asset_index_u16
     );
     Ok(())
 }
@@ -1123,29 +840,23 @@ fn process_settle_funding(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Pro
 // Tag 6: RepairExtraAccountMetas
 // ═══════════════════════════════════════════════════════════════
 
-/// Rewrite the ExtraAccountMetaList PDA for an existing NFT mint so its
-/// account-flag table matches the current processor's output. The
-/// original MintPositionNft emitted this PDA with the slab marked
-/// read-only, which makes every transfer fail with "writable privilege
-/// escalated" when the transfer hook CPIs TransferOwnershipCpi. Burn +
-/// remint is not a workaround — burn requires the position already closed.
+/// Rewrite the ExtraAccountMetaList PDA for an existing NFT mint.
 ///
-/// Permissionless: the data written is fully determined by the on-chain
-/// state linked to `nft_mint` (slab key + percolator-prog id via
-/// slab.owner). A caller cannot smuggle in a malicious value.
+/// Permissionless: data written is fully determined by on-chain state
+/// (portfolio key + percolator-prog id via portfolio.owner).
 fn process_repair_extra_metas(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
-    let payer = next_account_info(accounts_iter)?;       // 0: signer, writable
+    let payer = next_account_info(accounts_iter)?; // 0: signer, writable
     let extra_metas = next_account_info(accounts_iter)?; // 1: writable
-    let nft_mint = next_account_info(accounts_iter)?;    // 2: PDA seed input
-    let nft_pda = next_account_info(accounts_iter)?;     // 3: position NFT PDA
-    let slab = next_account_info(accounts_iter)?;        // 4: slab (read-only, for keys)
-    let mint_auth = next_account_info(accounts_iter)?;   // 5: mint auth PDA
-    let system_program = next_account_info(accounts_iter)?; // 6: system program (CPI transfer)
+    let nft_mint = next_account_info(accounts_iter)?; // 2: PDA seed input
+    let nft_pda = next_account_info(accounts_iter)?; // 3: position NFT PDA
+    let portfolio = next_account_info(accounts_iter)?; // 4: portfolio account (read-only, for keys)
+    let mint_auth = next_account_info(accounts_iter)?; // 5: mint auth PDA
+    let system_program = next_account_info(accounts_iter)?; // 6: system program
 
     if !payer.is_signer {
         msg!("RepairExtraMetas: payer must sign");
@@ -1160,13 +871,7 @@ fn process_repair_extra_metas(
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // Verify the extra_metas PDA is derived from the claimed nft_mint AND
-    // is owned by this program — prevents rewriting an arbitrary
-    // program-owned account that merely happens to satisfy size checks.
-    // Arg order matches the function signature (mint, program_id) — same
-    // order MintPositionNft uses when it initialises the account.
-    let (expected_extra_metas, _bump) =
-        extra_account_metas_pda(nft_mint.key, program_id);
+    let (expected_extra_metas, _bump) = extra_account_metas_pda(nft_mint.key, program_id);
     if *extra_metas.key != expected_extra_metas {
         msg!("RepairExtraMetas: extra_metas PDA does not match derivation");
         return Err(NftError::InvalidExtraAccountMetas.into());
@@ -1176,44 +881,40 @@ fn process_repair_extra_metas(
         return Err(NftError::InvalidExtraAccountMetas.into());
     }
 
-    // Verify the nft_pda is this program's PositionNft state account and
-    // links to the claimed nft_mint + slab. This pins the three-tuple
-    // (mint, slab, nft_pda) so the entries we're about to write match the
-    // original mint's state.
+    // Verify nft_pda is this program's PositionNftV16 state account.
     if nft_pda.owner != program_id {
         msg!("RepairExtraMetas: nft_pda not owned by this program");
         return Err(ProgramError::IllegalOwner);
     }
-    let nft_state_data = nft_pda.try_borrow_data()?;
-    if nft_state_data.len() < POSITION_NFT_LEN {
-        return Err(ProgramError::InvalidAccountData);
+    let asset_index_u16;
+    {
+        let nft_state_data = nft_pda.try_borrow_data()?;
+        if nft_state_data.len() < POSITION_NFT_V16_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let nft_state =
+            bytemuck::from_bytes::<PositionNftV16>(&nft_state_data[..POSITION_NFT_V16_LEN]);
+        verify_position_nft(nft_state)?;
+        if nft_state.portfolio_account != portfolio.key.to_bytes() {
+            msg!("RepairExtraMetas: nft_pda.portfolio_account does not match portfolio account");
+            return Err(NftError::InvalidNftPda.into());
+        }
+        if nft_state.nft_mint != nft_mint.key.to_bytes() {
+            msg!("RepairExtraMetas: nft_pda.nft_mint does not match nft_mint account");
+            return Err(NftError::InvalidNftPda.into());
+        }
+        asset_index_u16 = nft_state.asset_index.get() as u16;
+        // Verify canonical PDA derivation.
+        let (expected_pda, _) = position_nft_pda(portfolio.key, asset_index_u16, program_id);
+        if *nft_pda.key != expected_pda {
+            msg!("RepairExtraMetas: nft_pda does not match canonical derivation");
+            return Err(NftError::InvalidNftPda.into());
+        }
     }
-    let nft_state =
-        bytemuck::from_bytes::<PositionNft>(&nft_state_data[..POSITION_NFT_LEN]);
-    if nft_state.magic != crate::state::POSITION_NFT_MAGIC {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    if nft_state.slab != slab.key.to_bytes() {
-        msg!("RepairExtraMetas: nft_pda.slab does not match slab account");
-        return Err(NftError::InvalidNftPda.into());
-    }
-    if nft_state.nft_mint != nft_mint.key.to_bytes() {
-        msg!("RepairExtraMetas: nft_pda.nft_mint does not match nft_mint account");
-        return Err(NftError::InvalidNftPda.into());
-    }
-    let user_idx = nft_state.user_idx;
-    // Verify the PDA's canonical derivation.
-    let (expected_pda, _) = position_nft_pda(slab.key, user_idx, program_id);
-    if *nft_pda.key != expected_pda {
-        msg!("RepairExtraMetas: nft_pda does not match canonical derivation");
-        return Err(NftError::InvalidNftPda.into());
-    }
-    drop(nft_state_data);
 
-    // Percolator program id is read from slab.owner, so an attacker
-    // supplying a bogus slab would fail the ownership check.
-    verify_slab_owner(slab)?;
-    let percolator_prog_id = *slab.owner;
+    // Percolator program id from portfolio.owner (allowlist-verified).
+    cpi_v16::verify_portfolio_program(portfolio)?;
+    let percolator_prog_id = *portfolio.owner;
 
     // mint_auth is validated as a canonical PDA of this program.
     let (expected_mint_auth, _) = mint_authority_pda(program_id);
@@ -1222,26 +923,15 @@ fn process_repair_extra_metas(
         return Err(NftError::InvalidMintAuthority.into());
     }
 
-    // Rewrite the PDA data to mirror the constants used by MintPositionNft
-    // post-fix. Six entries now: the NFT program (self) is entry 6 so its
-    // AccountInfo reaches process_execute and can be forwarded to the
-    // invoke_signed CPI into percolator-prog.
-    //
-    // The existing ExtraAccountMetaList account was sized for 5 entries
-    // (191 bytes). A 6th entry needs an extra 35 bytes of space plus a
-    // 4-byte bump to the tlv_value_len header. Grow the account with
-    // realloc before we overwrite data — repair tx pays the rent diff.
     const EXTRA_META_ENTRY_LEN: usize = 35;
     const EXTRA_META_COUNT: usize = 6;
-    const HEADER_LEN: usize = 16; // discriminator(8) + tlv_value_len(4) + entry_count(4)
+    const HEADER_LEN: usize = 16;
     const EXTRA_METAS_ACCOUNT_LEN: usize =
-        HEADER_LEN + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT; // 226
+        HEADER_LEN + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
 
     let mut data = extra_metas.try_borrow_mut_data()?;
     if data.len() < EXTRA_METAS_ACCOUNT_LEN {
         drop(data);
-        // Top up rent for the larger size BEFORE realloc so the end-of-tx
-        // rent-exempt check passes. realloc itself does not move lamports.
         let rent = Rent::get()?;
         let needed = rent.minimum_balance(EXTRA_METAS_ACCOUNT_LEN);
         let current = extra_metas.lamports();
@@ -1252,23 +942,22 @@ fn process_repair_extra_metas(
                 &[payer.clone(), extra_metas.clone(), system_program.clone()],
             )?;
         }
-        extra_metas.realloc(EXTRA_METAS_ACCOUNT_LEN, true)?;
+        extra_metas.resize(EXTRA_METAS_ACCOUNT_LEN)?;
         data = extra_metas.try_borrow_mut_data()?;
     }
 
-    // Header (same layout as mint).
     data[0..8].copy_from_slice(&EXECUTE_DISCRIMINATOR);
     let tlv_value_len: u32 = (4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT) as u32;
     data[8..12].copy_from_slice(&tlv_value_len.to_le_bytes());
     data[12..16].copy_from_slice(&(EXTRA_META_COUNT as u32).to_le_bytes());
 
     let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
-        (*nft_pda.key, false, true),                 // 5: PositionNft PDA — writable
-        (*slab.key, false, true),                    // 6: Slab — WRITABLE (the fix)
-        (percolator_prog_id, false, false),          // 7: Percolator program — read-only
-        (*mint_auth.key, false, false),              // 8: Mint authority PDA — read-only
-        (sysvar_instructions::id(), false, false),   // 9: Instructions sysvar — read-only
-        (*program_id, false, false),                 // 10: NFT program (self) — read-only
+        (*nft_pda.key, false, true),       // 5: PositionNft PDA — writable
+        (*portfolio.key, false, true),     // 6: Portfolio account — WRITABLE (B-3 CPI)
+        (percolator_prog_id, false, false), // 7: Percolator program — read-only
+        (*mint_auth.key, false, false),    // 8: Mint authority PDA — read-only
+        (sysvar_instructions::id(), false, false), // 9: Instructions sysvar — read-only
+        (*program_id, false, false),       // 10: NFT program (self) — read-only
     ];
     for (i, (key, is_signer, is_writable)) in entries.iter().enumerate() {
         let off = HEADER_LEN + i * EXTRA_META_ENTRY_LEN;
@@ -1279,7 +968,7 @@ fn process_repair_extra_metas(
     }
 
     msg!(
-        "RepairExtraMetas: rewrote ExtraAccountMetaList for mint {} (slab now writable)",
+        "RepairExtraMetas: rewrote ExtraAccountMetaList for mint {} (portfolio now writable)",
         nft_mint.key
     );
     Ok(())

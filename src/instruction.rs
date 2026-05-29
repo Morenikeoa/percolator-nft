@@ -128,8 +128,9 @@ pub const TAG_REPAIR_EXTRA_METAS: u8 = 6;
 
 /// Decoded instruction for the Position NFT program.
 pub enum NftInstruction {
-    /// Mint an NFT for a position.
-    MintPositionNft { user_idx: u16 },
+    /// Mint an NFT for a position. `asset_index` identifies the portfolio leg
+    /// (matched against `legs[].asset_index`), not an array slot.
+    MintPositionNft { asset_index: u16 },
     /// Burn an NFT, releasing the position.
     BurnPositionNft,
     /// Settle accrued funding on the NFT state.
@@ -164,8 +165,8 @@ impl NftInstruction {
                 if rest.len() < 2 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let user_idx = u16::from_le_bytes([rest[0], rest[1]]);
-                Ok(NftInstruction::MintPositionNft { user_idx })
+                let asset_index = u16::from_le_bytes([rest[0], rest[1]]);
+                Ok(NftInstruction::MintPositionNft { asset_index })
             }
             TAG_BURN_POSITION_NFT => Ok(NftInstruction::BurnPositionNft),
             TAG_SETTLE_FUNDING => Ok(NftInstruction::SettleFunding),

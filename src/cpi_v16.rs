@@ -110,23 +110,37 @@ pub fn verify_bound_leg(
     Ok(slot)
 }
 
-/// EmergencyBurn eligibility — the escape hatch for an NFT whose underlying
-/// position is gone or flat (so the normal `verify_bound_leg` reuse check
-/// would strand the holder). Eligible iff there is NO active leg for the
-/// asset, OR the active leg is flat (`basis_pos_q == 0`). Deliberately does
-/// NOT run the market_id reuse check (that is the whole point).
+/// EmergencyBurn eligibility — the escape hatch to recover the NFT wrapper
+/// (and its rent) when the NFT's BOUND position no longer exists. Burning only
+/// destroys the NFT/PDA/ATA; it never touches the portfolio, so it is always
+/// safe once the bound position is gone.
+///
+/// Eligibility is keyed on the NFT's `market_id` (the position identity), NOT
+/// merely the asset_index — otherwise a holder is stranded when their position
+/// closed and the asset slot was REUSED by a newer position: normal Burn would
+/// reject (`MarketIdMismatch`) and an asset_index-only emergency check would
+/// also reject (`PositionNotClosed`), leaving the dead NFT unburnable.
+///
+/// Eligible iff: no active leg for the asset (bound position closed), OR the
+/// active leg's `market_id` differs from the mint snapshot (bound position
+/// closed and the slot was reused), OR the bound leg is flat (`basis_pos_q == 0`).
+/// Rejected only when the bound position (same market_id) is still open — then
+/// the holder must use normal Burn.
 pub fn emergency_burn_ok(
     portfolio: &PortfolioAccountV16Account,
     nft: &PositionNftV16,
 ) -> Result<(), NftError> {
     let asset_index = nft.asset_index.get();
     match portfolio.active_leg_slot_for_asset(asset_index) {
-        None => Ok(()), // no active leg → position closed/gone
+        None => Ok(()), // no active leg → bound position closed/gone
         Some(slot) => {
-            if portfolio.legs[slot].basis_pos_q.get() == 0 {
-                Ok(()) // flat (liquidated / fully reduced)
+            let leg = &portfolio.legs[slot];
+            if leg.market_id.get() != nft.market_id_at_mint.get() {
+                Ok(()) // bound position gone; asset slot reused by a newer position
+            } else if leg.basis_pos_q.get() == 0 {
+                Ok(()) // bound position flat (liquidated / fully reduced)
             } else {
-                Err(NftError::PositionNotClosed)
+                Err(NftError::PositionNotClosed) // bound position still open → use normal Burn
             }
         }
     }
@@ -221,22 +235,61 @@ mod tests {
     #[test]
     fn emergency_burn_eligibility() {
         let owner = [1u8; 32];
-        let nft = nft_for(9, 100, owner);
+        let nft = nft_for(9, 100, owner); // bound to asset 9, market_id 100
 
-        // no active leg -> eligible
+        // no active leg -> eligible (bound position closed)
         let p_closed: PortfolioAccountV16Account = Zeroable::zeroed();
         assert_eq!(emergency_burn_ok(&p_closed, &nft), Ok(()));
 
-        // active but flat (basis 0) -> eligible
+        // bound leg present (same market_id) but flat (basis 0) -> eligible
         let p_flat = portfolio_with_leg(owner, 9, 100, 0);
         assert_eq!(emergency_burn_ok(&p_flat, &nft), Ok(()));
 
-        // active and open -> NOT eligible (use normal Burn)
+        // bound leg present (same market_id) and open -> NOT eligible (use normal Burn)
         let p_open = portfolio_with_leg(owner, 9, 100, 500);
         assert_eq!(
             emergency_burn_ok(&p_open, &nft),
             Err(NftError::PositionNotClosed)
         );
+
+        // ESCAPE HATCH: asset slot reused by a NEWER open position (different
+        // market_id) -> eligible. Without market_id-awareness this would strand
+        // the holder (normal Burn rejects MarketIdMismatch; an asset-only
+        // emergency check would reject PositionNotClosed).
+        let p_reused = portfolio_with_leg(owner, 9, 205, 9999);
+        assert_eq!(emergency_burn_ok(&p_reused, &nft), Ok(()));
+        // and normal Burn on the same reused slab is correctly blocked:
+        assert_eq!(
+            verify_bound_leg(&p_reused, &nft),
+            Err(NftError::MarketIdMismatch)
+        );
+    }
+
+    #[test]
+    fn handler_decision_lifecycle() {
+        // Walk the per-handler decision functions across an NFT's life on one
+        // portfolio: mint -> (transfer gate) -> settle/burn while open ->
+        // close -> burn blocked / emergency-burn allowed.
+        let owner = [1u8; 32];
+        let p_open = portfolio_with_leg(owner, 9, 100, 500);
+
+        // Mint: eligible, returns the leg slot.
+        let slot = mint_leg_slot(&p_open, &owner, 9).expect("mint");
+        let nft = nft_for(9, 100, owner);
+
+        // Transfer gate (hook/B-3): clean -> transferable on the same slot.
+        assert_eq!(transfer_gate_check(&p_open, 9), Ok(slot));
+        // Burn / Settle: position intact -> bound leg verified on the same slot.
+        assert_eq!(verify_bound_leg(&p_open, &nft), Ok(slot));
+        // EmergencyBurn while open -> rejected (use normal Burn).
+        assert_eq!(emergency_burn_ok(&p_open, &nft), Err(NftError::PositionNotClosed));
+
+        // Position closed (leg gone): Burn/Settle -> LegNotActive; transfer
+        // gate -> LegNotActive; EmergencyBurn -> allowed (recover rent).
+        let p_closed: PortfolioAccountV16Account = Zeroable::zeroed();
+        assert_eq!(verify_bound_leg(&p_closed, &nft), Err(NftError::LegNotActive));
+        assert_eq!(transfer_gate_check(&p_closed, 9), Err(NftError::LegNotActive));
+        assert_eq!(emergency_burn_ok(&p_closed, &nft), Ok(()));
     }
 
     #[test]

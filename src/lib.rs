@@ -1,14 +1,11 @@
 #![forbid(unsafe_code)]
 
-pub mod cpi;
 pub mod cpi_v16;
 pub mod entrypoint;
 pub mod error;
 pub mod instruction;
 pub mod processor;
-pub mod slab_types;
 pub mod slab_types_v16;
-pub mod state;
 pub mod state_v16;
 pub mod token2022;
 pub mod transfer_hook;

@@ -1,13 +1,10 @@
-//! GetPositionValue — read-only valuation for marketplaces and lending protocols.
+//! GetPositionValue — read-only v16 position data for marketplaces and lending
+//! protocols.
 //!
-//! Returns all data needed to value a position NFT:
-//! - Unrealized PnL at current oracle price
-//! - Net equity (collateral + unrealized PnL)
-//! - Distance to liquidation (%)
-//! - Current funding rate per slot
-//! - Entry price, current size, direction, market
-//!
-//! All computed from existing on-chain slab state — no new data needed.
+//! Logs raw v16 leg fields via `POSITION_VALUE_V16:` prefixed `msg!` lines.
+//! Does NOT re-derive an equity or margin formula — v16's formula is
+//! engine-internal; a re-derivation here would be wrong and mislead consumers.
+//! Clients use `simulateTransaction` to read the log output.
 
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
@@ -18,233 +15,114 @@ use solana_program::{
 };
 
 use crate::{
-    cpi::{read_position, verify_slab_owner},
-    error::NftError,
-    state::{verify_pda_version, PositionNft, POSITION_NFT_LEN, POSITION_NFT_MAGIC},
+    cpi_v16,
+    slab_types_v16,
+    state_v16::{verify_position_nft, PositionNftV16, POSITION_NFT_V16_LEN},
 };
-
-/// Read a u64 from slab data at offset (checked).
-fn read_u64_checked(data: &[u8], off: usize) -> Option<u64> {
-    if off + 8 > data.len() {
-        return None;
-    }
-    let bytes: [u8; 8] = data[off..off + 8].try_into().ok()?;
-    Some(u64::from_le_bytes(bytes))
-}
-
-/// Position valuation data returned by GetPositionValue.
-///
-/// All values are logged via msg! since Solana programs can't return
-/// data directly. Clients read from transaction logs or simulate.
-pub struct PositionValuation {
-    /// Slab (market) address.
-    pub slab: Pubkey,
-    /// User index in slab.
-    pub user_idx: u16,
-    /// 1 = long, 0 = short.
-    pub is_long: u8,
-    /// Entry price (E6 fixed-point).
-    pub entry_price_e6: u64,
-    /// Current position size in collateral micro-units.
-    pub size: u64,
-    /// Current mark/oracle price (E6 fixed-point).
-    pub mark_price_e6: u64,
-    /// Unrealized PnL in collateral micro-units (signed via i128).
-    pub unrealized_pnl: i128,
-    /// Collateral deposited (micro-units).
-    pub collateral: u64,
-    /// Net equity = collateral + unrealized_pnl.
-    pub net_equity: i128,
-    /// Maintenance margin requirement (micro-units).
-    pub maintenance_margin: u64,
-    /// Distance to liquidation: (equity - maint_margin) / equity * 10000 (bps).
-    /// Negative means already in liquidation zone.
-    pub liquidation_distance_bps: i64,
-    /// Funding index delta since NFT mint.
-    pub funding_delta_e18: i128,
-}
-
-// Engine field offsets are now layout-dependent — read from PositionData.
-// V0:     mark_price=0,    maint_margin=96
-// V1D:    mark_price=424,  maint_margin=80
-// V12_1:  mark_price=928,  maint_margin=104 (engine at 616, params+maint_margin at 616+104)
-// V12_17: mark_price=0 (last_oracle_price at engine+624), maint_margin=32 (params+0, ENGINE_OFF=504)
 
 /// Process GetPositionValue instruction.
 ///
 /// Accounts:
 ///   0. `[]`  PositionNft PDA
-///   1. `[]`  Slab account
+///   1. `[]`  Portfolio account
 ///
 /// Data: tag(1) — no additional data needed.
 ///
-/// Returns valuation via msg! logs (clients use simulateTransaction).
-pub fn process_get_position_value(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+/// Logs `POSITION_VALUE_V16:` lines (clients use simulateTransaction).
+pub fn process_get_position_value(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let nft_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
+    let portfolio = next_account_info(accounts_iter)?;
 
-    // Verify slab ownership.
-    verify_slab_owner(slab)?;
+    // ── Verify portfolio ownership ──
+    cpi_v16::verify_portfolio_program(portfolio)?;
 
-    // ── PERC-9003: Verify PDA is owned by this program ──
-    if nft_pda.owner != _program_id {
+    // ── Verify PDA is owned by this program ──
+    if nft_pda.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
 
-    // Read NFT PDA.
+    // ── Read PositionNftV16 state ──
     let pda_data = nft_pda.try_borrow_data()?;
-    if pda_data.len() < POSITION_NFT_LEN {
+    if pda_data.len() < POSITION_NFT_V16_LEN {
         return Err(ProgramError::InvalidAccountData);
     }
-    let nft_state = bytemuck::from_bytes::<PositionNft>(&pda_data[..POSITION_NFT_LEN]);
-    if nft_state.magic != POSITION_NFT_MAGIC {
+    let nft_state =
+        bytemuck::from_bytes::<PositionNftV16>(&pda_data[..POSITION_NFT_V16_LEN]);
+    verify_position_nft(nft_state)?;
+    if nft_state.portfolio_account != portfolio.key.to_bytes() {
         return Err(ProgramError::InvalidAccountData);
     }
-    verify_pda_version(nft_state)?;
-    if nft_state.slab != slab.key.to_bytes() {
-        return Err(ProgramError::InvalidAccountData);
-    }
 
-    // Read position from slab.
-    let slab_data = slab.try_borrow_data()?;
-    let position = read_position(&slab_data, nft_state.user_idx)?;
+    let asset_index = nft_state.asset_index.get();
+    drop(pda_data);
 
-    // PERC-N1: v12.17 slot-reuse bypass fix — verify position owner has not changed.
-    // On v12.17 slabs `account_id` is always 0; `account_id != stored` is always false.
-    // `position_owner` is the live discriminator that changes across slot occupants.
-    // MIGRATION GUARD: skip if position_owner == [0u8; 32] (pre-fix NFT). Tagged remove-after-devnet-wipe.
-    if nft_state.position_owner != [0u8; 32]
-        && position.owner.to_bytes() != nft_state.position_owner
-    {
-        msg!("GetPositionValue rejected: position owner changed — slot reuse detected (PERC-N1)");
-        return Err(NftError::SlotReused.into());
-    }
+    // ── Decode portfolio ──
+    let portfolio_data = portfolio.try_borrow_data()?;
+    let p = slab_types_v16::decode_portfolio(&portfolio_data)
+        .map_err(cpi_v16::map_decode_err)?;
 
-    // ── PERC-9060: Verify slab slot still matches PDA snapshot ──
-    // If the original position was closed and the slab slot reused for a
-    // different position, entry_price_e6 and/or is_long will differ from
-    // the values snapshotted at mint time. Without this check, valuation
-    // would return data for a completely different user's position —
-    // misleading lending protocols and marketplaces into mis-pricing the NFT.
-    if nft_state.entry_price_e6 != position.entry_price_e6
-        || nft_state.is_long != position.is_long
-    {
-        msg!(
-            "GetPositionValue rejected: slab slot reuse detected (PDA snapshot does not match live position)"
-        );
-        return Err(NftError::PositionMismatch.into());
-    }
-
-    if position.size == 0 {
-        return Err(NftError::PositionNotOpen.into());
-    }
-
-    // engine_off comes from the slab layout detected in read_position().
-    let engine_off = position.engine_off;
-
-    // PERC-9060: Read mark price, returning an error instead of silently
-    // defaulting to 0. A zeroed mark price causes unrealized_pnl to compute
-    // as 0, making an underwater position appear break-even to consumers.
-    let mark_price_e6 = read_u64_checked(&slab_data, engine_off + position.engine_mark_price_off)
-        .ok_or(ProgramError::from(NftError::SlabDataTooShort))?;
-
-    // Read collateral from position data.
-    // position.collateral is the actual deposited margin (slab acct_off + ACCT_COLLATERAL_OFF).
-    // Do NOT use position.size here — size is the notional trade value, which for a leveraged
-    // position is size = collateral × leverage.  Using size inflates equity by the leverage factor.
-    let collateral = position.collateral;
-
-    // PERC-9018: Read maintenance_margin_bps as u64 (consistent with transfer_hook.rs).
-    // Previously the comment said u128 but transfer hook read it as u64. The engine
-    // field is maintenance_margin_bps: u64.
-    // PERC-9060: Propagate error instead of silently defaulting to 0.
-    // A zero maint_margin_bps would make any position appear healthy, matching
-    // the transfer_hook.rs pattern that uses .ok_or(NftError::SlabDataTooShort)?.
-    let maint_margin_bps: u64 = read_u64_checked(&slab_data, engine_off + position.engine_maint_margin_off)
-        .ok_or(ProgramError::from(NftError::SlabDataTooShort))?;
-
-    // PERC-9019: Compute PnL with checked arithmetic returning explicit errors
-    // instead of silently producing 0 via unwrap_or(0). A silently zeroed PnL
-    // can mislead lending protocols into over-valuing a position.
-    let unrealized_pnl: i128 = if position.entry_price_e6 > 0 && mark_price_e6 > 0 {
-        let size = position.size as i128;
-        let mark = mark_price_e6 as i128;
-        let entry = position.entry_price_e6 as i128;
-
-        let price_diff = if position.is_long == 1 {
-            mark.checked_sub(entry)
-                .ok_or(ProgramError::ArithmeticOverflow)?
-        } else {
-            entry.checked_sub(mark)
-                .ok_or(ProgramError::ArithmeticOverflow)?
-        };
-        size.checked_mul(price_diff)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_div(entry)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-    } else {
-        0
-    };
-
-    let net_equity = (collateral as i128)
-        .checked_add(unrealized_pnl)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
-    // PERC-9060: Propagate arithmetic overflow instead of silently zeroing.
-    // A silently zeroed maintenance_margin makes a liquidatable position appear healthy.
-    let maintenance_margin = (position.size as u128)
-        .checked_mul(maint_margin_bps as u128)
-        .ok_or(ProgramError::ArithmeticOverflow)? / 10_000;
-    let liquidation_distance_bps: i64 = if net_equity > 0 {
-        let distance = net_equity
-            .checked_sub(maintenance_margin as i128)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        // PERC-9060: Use checked arithmetic and clamp before casting to prevent
-        // silent truncation/wrapping that could flip the sign and make an
-        // underwater position appear healthy to lending protocols.
-        let bps_i128 = distance
-            .checked_mul(10_000)
-            .unwrap_or(if distance < 0 { i128::MIN } else { i128::MAX })
-            / net_equity;
-        bps_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64
-    } else {
-        -10_000 // fully liquidatable
-    };
-
-    // PERC-9060: Propagate overflow instead of silently zeroing.
-    // A zeroed funding delta hides accrued funding costs from consumers.
-    let funding_delta_e18 = position
-        .global_funding_index_e18
-        .checked_sub(nft_state.last_funding_index_e18)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
-    // Log valuation data (clients read via simulateTransaction).
-    msg!(
-        "POSITION_VALUE:slab={}",
-        Pubkey::new_from_array(nft_state.slab)
-    );
-    msg!("POSITION_VALUE:idx={}", nft_state.user_idx);
-    msg!(
-        "POSITION_VALUE:direction={}",
-        if position.is_long == 1 {
-            "LONG"
-        } else {
-            "SHORT"
+    // ── Find active leg for the bound asset_index ──
+    match p.active_leg_slot_for_asset(asset_index) {
+        None => {
+            // No active leg — position closed or never existed.
+            msg!("POSITION_VALUE_V16:portfolio={}", portfolio.key);
+            msg!("POSITION_VALUE_V16:asset_index={}", asset_index);
+            msg!("POSITION_VALUE_V16:status=no_active_leg");
+            return Ok(());
         }
-    );
-    msg!("POSITION_VALUE:entry_price_e6={}", position.entry_price_e6);
-    msg!("POSITION_VALUE:size={}", position.size);
-    msg!("POSITION_VALUE:mark_price_e6={}", mark_price_e6);
-    msg!("POSITION_VALUE:unrealized_pnl={}", unrealized_pnl);
-    msg!("POSITION_VALUE:collateral={}", collateral);
-    msg!("POSITION_VALUE:net_equity={}", net_equity);
-    msg!("POSITION_VALUE:maintenance_margin={}", maintenance_margin);
-    msg!(
-        "POSITION_VALUE:liquidation_distance_bps={}",
-        liquidation_distance_bps
-    );
-    msg!("POSITION_VALUE:funding_delta_e18={}", funding_delta_e18);
+        Some(slot) => {
+            let leg = &p.legs[slot];
+
+            // Check for market_id mismatch (slot reuse). Non-gating for
+            // read-only: log the mismatch so marketplaces can detect staleness,
+            // but still return Ok so callers can observe the stale state.
+            let nft_market_id = {
+                let pda_data2 = nft_pda.try_borrow_data()?;
+                let ns = bytemuck::from_bytes::<PositionNftV16>(
+                    &pda_data2[..POSITION_NFT_V16_LEN],
+                );
+                ns.market_id_at_mint.get()
+            };
+
+            if leg.market_id.get() != nft_market_id {
+                msg!(
+                    "POSITION_VALUE_V16:portfolio={}",
+                    portfolio.key
+                );
+                msg!("POSITION_VALUE_V16:asset_index={}", asset_index);
+                msg!(
+                    "POSITION_VALUE_V16:status=slot_reuse_detected market_id_at_mint={} current_market_id={}",
+                    nft_market_id,
+                    leg.market_id.get()
+                );
+                return Ok(());
+            }
+
+            msg!("POSITION_VALUE_V16:portfolio={}", portfolio.key);
+            msg!("POSITION_VALUE_V16:asset_index={}", asset_index);
+            msg!("POSITION_VALUE_V16:market_id={}", leg.market_id.get());
+            msg!("POSITION_VALUE_V16:side={}", leg.side);
+            msg!(
+                "POSITION_VALUE_V16:basis_pos_q={}",
+                leg.basis_pos_q.get()
+            );
+            msg!("POSITION_VALUE_V16:f_snap={}", leg.f_snap.get());
+            msg!(
+                "POSITION_VALUE_V16:epoch_snap={}",
+                leg.epoch_snap.get()
+            );
+            msg!(
+                "POSITION_VALUE_V16:loss_weight={}",
+                leg.loss_weight.get()
+            );
+            msg!("POSITION_VALUE_V16:capital={}", p.capital.get());
+            msg!("POSITION_VALUE_V16:pnl={}", p.pnl.get());
+        }
+    }
 
     Ok(())
 }
