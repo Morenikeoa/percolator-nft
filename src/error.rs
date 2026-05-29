@@ -48,6 +48,23 @@ pub enum NftError {
     /// The slab slot at user_idx was closed and reassigned to a different owner
     /// after this NFT was minted. The original NFT is now invalid for this slot.
     SlotReused = 20,
+
+    // ── v16 (NFT sub-phase, append-only) ──
+    /// Portfolio account not owned by a known Percolator wrapper program
+    /// (v16 analog of `InvalidSlabOwner`; fail-closed allowlist).
+    InvalidPortfolioOwner = 21,
+    /// No active leg trades the requested `asset_index` in this portfolio.
+    LegNotActive = 22,
+    /// Portfolio account data failed v16 decode (header / provenance / owner
+    /// invariant). The specific `PortfolioDecodeError` is logged via `msg!`.
+    PortfolioDecodeFailed = 23,
+    /// Transfer blocked by the v16 close/resolve/stale gate
+    /// (`leg_transfer_gate`) — the position is not freely transferable.
+    TransferBlocked = 24,
+    /// v16 slot-reuse: the bound leg's `market_id` no longer matches the value
+    /// snapshotted at mint (the leg slot was closed and reused by a newer
+    /// position with a higher, never-reused market_id).
+    MarketIdMismatch = 25,
 }
 
 impl From<NftError> for ProgramError {

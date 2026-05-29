@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cpi;
+pub mod cpi_v16;
 pub mod entrypoint;
 pub mod error;
 pub mod instruction;

@@ -1,0 +1,260 @@
+//! v16 portfolio read + per-handler decision logic (the testable core).
+//!
+//! Replaces the v12 `crate::cpi` layer (slab `detect_layout`/`read_position`).
+//! v16 has ONE fixed layout, so the entire heuristic machinery collapses to
+//! [`crate::slab_types_v16::decode_portfolio`]. This module adds:
+//!   * [`verify_portfolio_program`] — fail-closed wrapper-program allowlist.
+//!   * the pure per-handler decision functions (mint eligibility, bound-leg /
+//!     slot-reuse verification, emergency-burn eligibility, transfer gate).
+//!
+//! The decision functions take an already-decoded `&PortfolioAccountV16Account`
+//! (+ `&PositionNftV16` where relevant) so they are pure and exhaustively
+//! unit-testable WITHOUT a Solana runtime. The on-chain handlers do account
+//! plumbing + the (unchanged) Token-2022 CPIs around these functions; the
+//! end-to-end path is verified by the A.5 LiteSVM suite.
+//!
+//! ## v16 position identity = `market_id` (slot-reuse anchor)
+//!
+//! v16 `market_id` is strictly monotonic and never reused (engine
+//! `next_market_id` only ever `checked_add(1)`). It uniquely identifies a
+//! position INSTANCE and is invariant across the NFT's life — it does NOT
+//! change on a legitimate ownership transfer or as the position is traded.
+//! It is therefore the ONLY correct slot-reuse anchor:
+//!   * `provenance.owner` changes on a legit B-3 transfer → useless as a reuse
+//!     gate (would false-positive on every transferred NFT).
+//!   * `leg.epoch_snap` advances with funding → useless as a reuse gate
+//!     (would false-positive on normal funding accrual).
+//!   * `leg.basis_pos_q` changes as the position is traded → not an identity.
+//! So the reuse check is `market_id`-only (design-correction (b), §16.2). The
+//! mint-time `epoch_snap`/`position_owner` snapshots are kept informational.
+
+use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
+
+use crate::error::NftError;
+use crate::slab_types_v16::{
+    LegTransferGate, PortfolioAccountV16Account, PortfolioDecodeError, WRAPPER_MAX_PORTFOLIO_ASSETS,
+};
+use crate::state_v16::PositionNftV16;
+
+// ═══════════════════════════════════════════════════════════════
+// Wrapper-program allowlist (fail-closed)
+// ═══════════════════════════════════════════════════════════════
+
+/// Known Percolator wrapper program IDs. The mainnet ID is the live wrapper
+/// (`ESa89R5…`, unchanged at v16 cutover per hard constraint #5).
+pub const PERCOLATOR_DEVNET: Pubkey =
+    solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
+pub const PERCOLATOR_MAINNET: Pubkey =
+    solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+
+/// Verify the portfolio account is owned by a known Percolator wrapper program.
+/// Fail-closed: anything not on the allowlist is rejected. (v16 analog of v12
+/// `verify_slab_owner`.)
+pub fn verify_portfolio_program(portfolio_ai: &AccountInfo) -> Result<(), ProgramError> {
+    if portfolio_ai.owner != &PERCOLATOR_DEVNET && portfolio_ai.owner != &PERCOLATOR_MAINNET {
+        return Err(NftError::InvalidPortfolioOwner.into());
+    }
+    Ok(())
+}
+
+/// Map a layout-decode failure to the NFT error space, logging the specific
+/// cause for diagnostics.
+pub fn map_decode_err(e: PortfolioDecodeError) -> ProgramError {
+    solana_program::msg!("portfolio decode failed: {:?}", e);
+    NftError::PortfolioDecodeFailed.into()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Per-handler decision logic (pure — unit-tested below)
+// ═══════════════════════════════════════════════════════════════
+
+/// MintPositionNft eligibility. Returns the leg array slot to snapshot.
+///
+/// Caller must be the portfolio owner; the requested `asset_index` must be in
+/// range and have an active leg. (No LP/User `kind` gate — v16 portfolios are
+/// trading accounts; LP vaults are a separate program surface.)
+pub fn mint_leg_slot(
+    portfolio: &PortfolioAccountV16Account,
+    caller_owner: &[u8; 32],
+    asset_index: u32,
+) -> Result<usize, NftError> {
+    if asset_index >= WRAPPER_MAX_PORTFOLIO_ASSETS as u32 {
+        return Err(NftError::LegNotActive);
+    }
+    if &portfolio.owner() != caller_owner {
+        return Err(NftError::NotNftHolder);
+    }
+    portfolio
+        .active_leg_slot_for_asset(asset_index)
+        .ok_or(NftError::LegNotActive)
+}
+
+/// Verify the leg this NFT was minted against is still the SAME position
+/// instance (used by Burn / SettleFunding). Returns the leg slot.
+///
+/// Slot-reuse is detected solely via `market_id` (see module docs): a reused
+/// slot necessarily carries a different, higher market_id. This does NOT
+/// false-positive on a legit ownership transfer (market_id is invariant) — that
+/// is exactly why `provenance.owner` is NOT part of the check.
+pub fn verify_bound_leg(
+    portfolio: &PortfolioAccountV16Account,
+    nft: &PositionNftV16,
+) -> Result<usize, NftError> {
+    let asset_index = nft.asset_index.get();
+    let slot = portfolio
+        .active_leg_slot_for_asset(asset_index)
+        .ok_or(NftError::LegNotActive)?;
+    if portfolio.legs[slot].market_id.get() != nft.market_id_at_mint.get() {
+        return Err(NftError::MarketIdMismatch);
+    }
+    Ok(slot)
+}
+
+/// EmergencyBurn eligibility — the escape hatch for an NFT whose underlying
+/// position is gone or flat (so the normal `verify_bound_leg` reuse check
+/// would strand the holder). Eligible iff there is NO active leg for the
+/// asset, OR the active leg is flat (`basis_pos_q == 0`). Deliberately does
+/// NOT run the market_id reuse check (that is the whole point).
+pub fn emergency_burn_ok(
+    portfolio: &PortfolioAccountV16Account,
+    nft: &PositionNftV16,
+) -> Result<(), NftError> {
+    let asset_index = nft.asset_index.get();
+    match portfolio.active_leg_slot_for_asset(asset_index) {
+        None => Ok(()), // no active leg → position closed/gone
+        Some(slot) => {
+            if portfolio.legs[slot].basis_pos_q.get() == 0 {
+                Ok(()) // flat (liquidated / fully reduced)
+            } else {
+                Err(NftError::PositionNotClosed)
+            }
+        }
+    }
+}
+
+/// Transfer gate (used by ExecuteTransferHook and wrapper B-3). Maps
+/// [`LegTransferGate`] to a Result. `Ok(slot)` only when the leg is active and
+/// no close/resolve/stale/lock gate is engaged (original NFT bug #3).
+pub fn transfer_gate_check(
+    portfolio: &PortfolioAccountV16Account,
+    asset_index: u32,
+) -> Result<usize, NftError> {
+    match portfolio.leg_transfer_gate(asset_index) {
+        LegTransferGate::Transferable(slot) => Ok(slot),
+        LegTransferGate::NoActiveLeg => Err(NftError::LegNotActive),
+        _ => Err(NftError::TransferBlocked),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slab_types_v16::{V16PodI128, V16PodU32, V16PodU64};
+    use crate::state_v16::{PositionNftV16, POSITION_NFT_V16_MAGIC, POSITION_NFT_V16_VERSION};
+    use bytemuck::Zeroable;
+
+    fn portfolio_with_leg(owner: [u8; 32], asset_index: u32, market_id: u64, basis: i128)
+        -> PortfolioAccountV16Account
+    {
+        let mut acct: PortfolioAccountV16Account = Zeroable::zeroed();
+        acct.owner = owner;
+        acct.provenance_header.owner = owner;
+        acct.legs[4].active = 1;
+        acct.legs[4].asset_index = V16PodU32::new(asset_index);
+        acct.legs[4].market_id = V16PodU64::new(market_id);
+        acct.legs[4].basis_pos_q = V16PodI128::new(basis);
+        acct
+    }
+
+    fn nft_for(asset_index: u32, market_id: u64, owner: [u8; 32]) -> PositionNftV16 {
+        let mut n: PositionNftV16 = Zeroable::zeroed();
+        n.magic = V16PodU64::new(POSITION_NFT_V16_MAGIC);
+        n.version = POSITION_NFT_V16_VERSION;
+        n.asset_index = V16PodU32::new(asset_index);
+        n.market_id_at_mint = V16PodU64::new(market_id);
+        n.position_owner_at_mint = owner;
+        n
+    }
+
+    #[test]
+    fn mint_eligibility() {
+        let owner = [1u8; 32];
+        let p = portfolio_with_leg(owner, 9, 100, 500);
+        // happy
+        assert_eq!(mint_leg_slot(&p, &owner, 9), Ok(4));
+        // wrong owner
+        assert_eq!(mint_leg_slot(&p, &[2u8; 32], 9), Err(NftError::NotNftHolder));
+        // no active leg for that asset
+        assert_eq!(mint_leg_slot(&p, &owner, 10), Err(NftError::LegNotActive));
+        // out of range (>= WRAPPER_MAX_PORTFOLIO_ASSETS = 14)
+        assert_eq!(mint_leg_slot(&p, &owner, 14), Err(NftError::LegNotActive));
+    }
+
+    #[test]
+    fn slot_reuse_regression_via_market_id() {
+        let owner = [1u8; 32];
+        let nft = nft_for(9, 100, owner);
+
+        // same market_id -> bound leg verified (the position instance is intact)
+        let p_ok = portfolio_with_leg(owner, 9, 100, 500);
+        assert_eq!(verify_bound_leg(&p_ok, &nft), Ok(4));
+
+        // legit ownership transfer: owner changed, market_id SAME -> still OK
+        // (proves market_id-only does NOT false-positive on transfer).
+        let mut p_transferred = portfolio_with_leg([7u8; 32], 9, 100, 500);
+        p_transferred.provenance_header.owner = [7u8; 32];
+        assert_eq!(verify_bound_leg(&p_transferred, &nft), Ok(4));
+
+        // slot reused by a NEW position: same asset_index, DIFFERENT market_id
+        // (higher, never-reused) -> MarketIdMismatch.
+        let p_reused = portfolio_with_leg(owner, 9, 101, 500);
+        assert_eq!(
+            verify_bound_leg(&p_reused, &nft),
+            Err(NftError::MarketIdMismatch)
+        );
+
+        // position closed (no active leg) -> LegNotActive (holder uses EmergencyBurn).
+        let p_closed: PortfolioAccountV16Account = Zeroable::zeroed();
+        assert_eq!(verify_bound_leg(&p_closed, &nft), Err(NftError::LegNotActive));
+    }
+
+    #[test]
+    fn emergency_burn_eligibility() {
+        let owner = [1u8; 32];
+        let nft = nft_for(9, 100, owner);
+
+        // no active leg -> eligible
+        let p_closed: PortfolioAccountV16Account = Zeroable::zeroed();
+        assert_eq!(emergency_burn_ok(&p_closed, &nft), Ok(()));
+
+        // active but flat (basis 0) -> eligible
+        let p_flat = portfolio_with_leg(owner, 9, 100, 0);
+        assert_eq!(emergency_burn_ok(&p_flat, &nft), Ok(()));
+
+        // active and open -> NOT eligible (use normal Burn)
+        let p_open = portfolio_with_leg(owner, 9, 100, 500);
+        assert_eq!(
+            emergency_burn_ok(&p_open, &nft),
+            Err(NftError::PositionNotClosed)
+        );
+    }
+
+    #[test]
+    fn transfer_gate_maps_reasons() {
+        let owner = [1u8; 32];
+        // transferable
+        let p = portfolio_with_leg(owner, 9, 100, 500);
+        assert_eq!(transfer_gate_check(&p, 9), Ok(4));
+        // no active leg
+        assert_eq!(transfer_gate_check(&p, 10), Err(NftError::LegNotActive));
+        // blocked by lock
+        let mut p_locked = portfolio_with_leg(owner, 9, 100, 500);
+        p_locked.liquidation_lock = 1;
+        assert_eq!(transfer_gate_check(&p_locked, 9), Err(NftError::TransferBlocked));
+        // blocked by close-in-progress
+        let mut p_closing = portfolio_with_leg(owner, 9, 100, 500);
+        p_closing.close_progress.active = 1;
+        p_closing.close_progress.asset_index = V16PodU32::new(9);
+        assert_eq!(transfer_gate_check(&p_closing, 9), Err(NftError::TransferBlocked));
+    }
+}
