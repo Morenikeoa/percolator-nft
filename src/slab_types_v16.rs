@@ -9,10 +9,11 @@
 //! * `PortfolioAccountV16Account` now embeds a fixed sparse
 //!   `source_domains: [PortfolioSourceDomainV16Account; 32]` array (32 × 196 B =
 //!   6272 B) between `legs` and `health_cert`, growing the fixed head from 2907 B
-//!   to 9179 B.
-//! * The `capital`/`pnl`/`reserved_pnl` fields are replaced by three
-//!   `residual_*_atoms_total` counters (same 48 B total — net zero size change
-//!   from those fields).
+//!   to 9227 B.
+//! * `capital`, `pnl`, `reserved_pnl` are RETAINED from v16 (each 16 B, total
+//!   48 B); they precede the `residual_*_atoms_total` counters.
+//! * Additionally three `residual_*_atoms_total` counters are present, adding
+//!   48 B to the v16 layout (v17 gain).
 //! * `PORTFOLIO_SOURCE_DOMAIN_CAP` is `cfg(not(kani))=32` / `cfg(kani)=4`
 //!   (mirroring the engine); the NFT program never runs under kani, so production
 //!   always uses 32 and the vendored constant hard-codes that value.
@@ -29,7 +30,7 @@
 //! ```
 //!
 //! [`decode_portfolio`] reads `HEADER_LEN .. HEADER_LEN + EXPECTED_PORTFOLIO_ACCOUNT_SIZE`
-//! and bytemuck-casts it — field access by name removes all hand-computed offsets.
+//! (16 .. 9243) and bytemuck-casts it — field access by name removes all hand-computed offsets.
 //!
 //! ## BPF / host byte-identity
 //!
@@ -54,10 +55,12 @@ use core::mem::{align_of, offset_of, size_of};
 /// layout. Stamped into every minted NFT so re-vendoring invalidates older NFTs
 /// rather than silently decoding with wrong offsets.
 ///
-/// Revision 4: v17 layout — 9179-byte fixed `PortfolioAccountV16Account` with
-/// inline `source_domains` array + residual counters. Supersedes revision 3
-/// (v16 2907-byte head, variable 2N source-domain tail).
-pub const LAYOUT_REVISION: u32 = 4;
+/// Revision 5: v17 layout — 9227-byte fixed `PortfolioAccountV16Account` with
+/// inline `source_domains` array + retained `capital`/`pnl`/`reserved_pnl` +
+/// residual counters. Corrects revision 4 which incorrectly dropped those 48 B,
+/// shifting legs array 48 bytes early and causing Custom(22) LegNotActive at
+/// runtime in the transfer hook. Supersedes revision 4.
+pub const LAYOUT_REVISION: u32 = 5;
 
 // ════════════════════════════════════════════════════════════════════════════
 // WRAPPER ACCOUNT HEADER — percolator-prog/src/v16_program.rs constants
@@ -103,7 +106,7 @@ pub const EXPECTED_SOURCE_DOMAIN_SIZE: usize = 196;
 pub const EXPECTED_HEALTH_CERT_SIZE: usize = 121;
 pub const EXPECTED_CLOSE_PROGRESS_SIZE: usize = 184;
 pub const EXPECTED_RESOLVED_PAYOUT_RECEIPT_SIZE: usize = 66;
-pub const EXPECTED_PORTFOLIO_ACCOUNT_SIZE: usize = 9179;
+pub const EXPECTED_PORTFOLIO_ACCOUNT_SIZE: usize = 9227;
 
 // ════════════════════════════════════════════════════════════════════════════
 // POD SCALAR WRAPPERS — byte arrays, align 1 (percolator/src/v16.rs:3181-3255)
@@ -385,7 +388,13 @@ const _: () = assert!(offset_of!(ResolvedPayoutReceiptV16Account, finalized) == 
 pub struct PortfolioAccountV16Account {
     pub provenance_header: ProvenanceHeaderV16Account,
     pub owner: [u8; 32],
-    // v17 residual-farming counters (replaced v16 capital/pnl/reserved_pnl).
+    // v16 legacy margin-accounting fields — RETAINED in v17 (NOT dropped).
+    // These 48 B precede the residual counters; the revision-4 vendor
+    // incorrectly omitted them, shifting legs by -48 B.
+    pub capital: V16PodU128,
+    pub pnl: V16PodI128,
+    pub reserved_pnl: V16PodU128,
+    // v17 residual-farming counters (additive; sit after capital/pnl/reserved_pnl).
     pub residual_crystallized_loss_atoms_total: V16PodU128,
     pub residual_spent_principal_atoms_total: V16PodU128,
     pub residual_received_atoms_total: V16PodU128,
@@ -407,22 +416,28 @@ pub struct PortfolioAccountV16Account {
 
 const _: () = assert!(size_of::<PortfolioAccountV16Account>() == EXPECTED_PORTFOLIO_ACCOUNT_SIZE);
 const _: () = assert!(align_of::<PortfolioAccountV16Account>() == 1);
-// Spot-check offsets that the NFT or its decode logic depend on.
+// Spot-check offsets — byte-exact match against percolator/src/v16.rs:14898.
 const _: () = assert!(offset_of!(PortfolioAccountV16Account, provenance_header) == 0);
 const _: () = assert!(offset_of!(PortfolioAccountV16Account, owner) == 100);
-// residual counters at 132 (three × 16 = 48 B, same total as v16 capital/pnl/reserved_pnl)
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, fee_credits) == 180);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, last_fee_slot) == 212);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, active_bitmap) == 220);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, legs) == 228);
-// source_domains inserted here: 228 + 144*16 = 228 + 2304 = 2532
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, source_domains) == 2532);
-// health_cert at 2532 + 196*32 = 2532 + 6272 = 8804
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, health_cert) == 8804);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, stale_state) == 8925);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, liquidation_lock) == 8928);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, close_progress) == 8929);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, resolved_payout_receipt) == 9113);
+// capital/pnl/reserved_pnl at 132/148/164 (retained from v16 — NOT dropped)
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, capital) == 132);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, pnl) == 148);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, reserved_pnl) == 164);
+// residual counters start at 180 (after capital/pnl/reserved_pnl)
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, residual_crystallized_loss_atoms_total) == 180);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, fee_credits) == 228);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, last_fee_slot) == 260);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, active_bitmap) == 268);
+// legs at 276 (NOT 228 — revision 4 had this wrong by 48 B)
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, legs) == 276);
+// source_domains: 276 + 144*16 = 276 + 2304 = 2580
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, source_domains) == 2580);
+// health_cert: 2580 + 196*32 = 2580 + 6272 = 8852
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, health_cert) == 8852);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, stale_state) == 8973);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, liquidation_lock) == 8976);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, close_progress) == 8977);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, resolved_payout_receipt) == 9161);
 
 // ════════════════════════════════════════════════════════════════════════════
 // DECODE — mirrors percolator-prog `portfolio_wire`
@@ -581,7 +596,7 @@ mod tests {
 
     /// Build a minimal valid wrapper-framed portfolio buffer for an owner with a
     /// single active leg. Mirrors the wrapper's `[header][POD][tail]` framing.
-    /// v17: the POD is 9179 B; the tail (inline matcher cfg) is ignored by NFT.
+    /// v17: the POD is 9227 B; the tail (inline matcher cfg) is ignored by NFT.
     fn framed(owner: [u8; 32], asset_index: u32, market_id: u64) -> Vec<u8> {
         let mut acct = empty_account();
         acct.provenance_header.owner = owner;
@@ -605,7 +620,7 @@ mod tests {
     #[test]
     fn sizes_match_engine_ground_truth() {
         // These values must match the v17 engine's actual struct sizes.
-        assert_eq!(size_of::<PortfolioAccountV16Account>(), 9179);
+        assert_eq!(size_of::<PortfolioAccountV16Account>(), 9227);
         assert_eq!(size_of::<ProvenanceHeaderV16Account>(), 100);
         assert_eq!(size_of::<PortfolioLegV16Account>(), 144);
         assert_eq!(size_of::<PortfolioSourceDomainV16Account>(), 196);
@@ -620,8 +635,8 @@ mod tests {
     }
 
     #[test]
-    fn v17_layout_revision_is_4() {
-        assert_eq!(LAYOUT_REVISION, 4);
+    fn v17_layout_revision_is_5() {
+        assert_eq!(LAYOUT_REVISION, 5);
     }
 
     #[test]
@@ -757,12 +772,14 @@ mod tests {
         assert_eq!(PORTFOLIO_SOURCE_DOMAIN_CAP, 32);
         assert_eq!(
             size_of::<PortfolioAccountV16Account>(),
-            // Header (100) + owner (32) + residuals (48) + fee_credits (16) +
-            // cancel_escrow (16) + last_fee_slot (8) + bitmap (8) +
-            // legs (144*16) + source_domains (196*32) +
-            // health_cert (121) + 4 lock bytes + close_progress (184) +
+            // provenance_header (100) + owner (32) +
+            // capital (16) + pnl (16) + reserved_pnl (16) [retained from v16] +
+            // residuals (3*16=48) + fee_credits (16) + cancel_escrow (16) +
+            // last_fee_slot (8) + bitmap (8) +
+            // legs (144*16=2304) + source_domains (196*32=6272) +
+            // health_cert (121) + 4 lock/stale bytes + close_progress (184) +
             // resolved_receipt (66)
-            100 + 32 + 48 + 16 + 16 + 8 + 8 + 2304 + 6272 + 121 + 4 + 184 + 66
+            100 + 32 + 16 + 16 + 16 + 48 + 16 + 16 + 8 + 8 + 2304 + 6272 + 121 + 4 + 184 + 66
         );
     }
 }
