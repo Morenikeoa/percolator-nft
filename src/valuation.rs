@@ -119,8 +119,16 @@ pub fn process_get_position_value(
                 "POSITION_VALUE_V16:loss_weight={}",
                 leg.loss_weight.get()
             );
-            msg!("POSITION_VALUE_V16:capital={}", p.capital.get());
-            msg!("POSITION_VALUE_V16:pnl={}", p.pnl.get());
+            // v17: capital/pnl are now per-asset domain fields (not per-portfolio scalars).
+            // Log the portfolio-level residual counters that replaced them.
+            msg!(
+                "POSITION_VALUE_V16:residual_crystallized={}",
+                p.residual_crystallized_loss_atoms_total.get()
+            );
+            msg!(
+                "POSITION_VALUE_V16:residual_spent={}",
+                p.residual_spent_principal_atoms_total.get()
+            );
         }
     }
 

@@ -19,8 +19,8 @@ use solana_program::program_error::ProgramError;
 ///   6. `[]`                  Token-2022 program
 ///   7. `[]`                  Associated token account program
 ///   8. `[]`                  System program
-///   9. `[writable]`          ExtraAccountMetaList PDA (created) —
-///                            seeds: `[b"extra-account-metas", nft_mint]`
+///   9. `[writable]`          ExtraAccountMetaList PDA (created);
+///      seeds: `[b"extra-account-metas", nft_mint]`
 ///
 /// Data: tag(1) + user_idx(2)
 pub const TAG_MINT_POSITION_NFT: u8 = 0;
@@ -113,12 +113,12 @@ pub const TAG_EMERGENCY_BURN: u8 = 5;
 ///                            from a 5-entry (191-byte) layout to a 6-entry
 ///                            (226-byte) layout. No-op on accounts already
 ///                            sized for 6 entries.
-///   1. `[writable]`          ExtraAccountMetaList PDA
-///                            seeds: `[b"extra-account-metas", nft_mint]`
+///   1. `[writable]`          ExtraAccountMetaList PDA;
+///      seeds: `[b"extra-account-metas", nft_mint]`
 ///   2. `[]`                  NFT mint (PDA seed input, no reads)
-///   3. `[]`                  PositionNft PDA
-///                            seeds: `[b"position_nft", slab, user_idx LE]`
-///                            Read for user_idx + slab + nft_mint verification.
+///   3. `[]`                  PositionNft PDA;
+///      seeds: `[b"position_nft", slab, user_idx LE]`;
+///      read for user_idx + slab + nft_mint verification.
 ///   4. `[]`                  Slab account (provides slab.key + percolator_prog_id)
 ///   5. `[]`                  Mint authority PDA — entry #8 in the rewritten list
 ///   6. `[]`                  System program (rent top-up CPI)

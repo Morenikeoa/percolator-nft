@@ -1,55 +1,48 @@
-//! v16 portfolio layout — vendored Percolator v16 type definitions (NFT side).
+//! v17 portfolio layout — vendored Percolator v17 type definitions (NFT side).
 //!
 //! ## What this file is
 //!
-//! The v16-sync replacement for [`crate::slab_types`] (which vendored the v12 /
-//! v12.17 slab layout). It vendors the byte-image of the on-chain
-//! `PortfolioAccountV16Account` and its sub-structs from
-//! `percolator/src/v16.rs`, byte-for-byte, plus compile-time `size_of!` /
-//! `offset_of!` assertions that fail to compile if the vendored layout drifts.
+//! Re-vendored against the converged v17 engine (`percolator/src/v16.rs` at tag
+//! `v17-phase2-engine`). Replaces the v16-sync version (revision 3, 2907-byte
+//! `PortfolioAccountV16Account`) with the v17 layout:
 //!
-//! In v16, ONE `PortfolioAccountV16` is its own Solana account (not a slab
-//! entry). The wrapper stores it as:
+//! * `PortfolioAccountV16Account` now embeds a fixed sparse
+//!   `source_domains: [PortfolioSourceDomainV16Account; 32]` array (32 × 196 B =
+//!   6272 B) between `legs` and `health_cert`, growing the fixed head from 2907 B
+//!   to 9179 B.
+//! * The `capital`/`pnl`/`reserved_pnl` fields are replaced by three
+//!   `residual_*_atoms_total` counters (same 48 B total — net zero size change
+//!   from those fields).
+//! * `PORTFOLIO_SOURCE_DOMAIN_CAP` is `cfg(not(kani))=32` / `cfg(kani)=4`
+//!   (mirroring the engine); the NFT program never runs under kani, so production
+//!   always uses 32 and the vendored constant hard-codes that value.
+//!
+//! In v17, ONE `PortfolioAccountV16Account` is its own Solana account (no
+//! 2N dynamic tail — source-domains are now an inline fixed array). The wrapper
+//! stores it as:
 //!
 //! ```text
-//!   [ 16-byte wrapper header ][ PortfolioAccountV16Account ][ source-domain tail ]
-//!     MAGIC u64 @0                fixed 2907-byte POD          variable, ignored
-//!     VERSION u16 @8              starts at HEADER_LEN=16       by the NFT
+//!   [ 16-byte wrapper header ][ PortfolioAccountV16Account (9179 B) ][ inline matcher cfg tail ]
+//!     MAGIC u64 @0                fixed head                           104 B, ignored by NFT
+//!     VERSION u16 @8              starts at HEADER_LEN=16
 //!     kind   u8  @10
 //! ```
 //!
-//! See `percolator-prog/src/v16_program.rs` `portfolio_wire` (the wrapper's own
-//! decode): `data.get(HEADER_LEN .. HEADER_LEN + size_of::<PortfolioAccountV16Account>())`
-//! then `bytemuck` cast. [`decode_portfolio`] below mirrors that exactly.
-//!
-//! ## Layout-offset bug class — closed by construction
-//!
-//! The v12 NFT hardcoded an `ENGINE_OFF` derived from a chain of slab-size
-//! arithmetic; a stale value (off by hundreds of bytes) silently mis-decoded
-//! every position (commit `3d7d185`). v16 removes that entire surface:
-//!
-//! 1. The body offset is a single constant [`HEADER_LEN`] = 16 — no slab
-//!    tiering, no `RISK_BUF`, no per-account `GEN_TABLE` tail.
-//! 2. The NFT never computes a field offset by hand. It `bytemuck`-casts the
-//!    fixed window to [`PortfolioAccountV16Account`] and reads fields by name —
-//!    field access *is* the offset.
-//! 3. Compile-time `assert!` on every sub-struct size + the key field offsets
-//!    catch any vendoring drift; the LiteSVM integration test (later sub-phase)
-//!    is the ground truth: it creates a real portfolio through the wrapper and
-//!    decodes it through this module.
-//!
-//! Sizes/offsets below were confirmed by an empirical `size_of`/`offset_of`
-//! probe run against the engine crate (then reverted), NOT hand-computed.
+//! [`decode_portfolio`] reads `HEADER_LEN .. HEADER_LEN + EXPECTED_PORTFOLIO_ACCOUNT_SIZE`
+//! and bytemuck-casts it — field access by name removes all hand-computed offsets.
 //!
 //! ## BPF / host byte-identity
 //!
-//! Every 16/8/4/2-byte scalar uses a `#[repr(C)]` byte-array wrapper
-//! ([`V16PodU128`] = `[u8; 16]`, etc.), align 1. The whole struct is therefore
-//! packed with zero padding and is byte-identical on host (`cargo check`) and
-//! SBF (`cargo build-sbf`) with no `#[cfg(target_arch)]` gating — matching the
-//! engine's own `V16Pod*` POD wrappers (`percolator/src/v16.rs:3181-3255`).
+//! Every multi-byte scalar uses a `#[repr(C)]` byte-array wrapper (align 1).
+//! The whole struct is packed with zero padding, byte-identical on host and SBF.
+//!
+//! ## Compile-time guards
+//!
+//! `const_assert!` on every sub-struct size + key field offsets fail to compile
+//! if the vendored layout drifts from the engine. The LiteSVM integration test
+//! (cross-cut phase) is the runtime ground truth.
 
-#![allow(dead_code)] // wired into cpi.rs / processor.rs in the next NFT sub-phase
+#![allow(dead_code)] // wired into cpi.rs / processor.rs
 
 use core::mem::{align_of, offset_of, size_of};
 
@@ -57,17 +50,17 @@ use core::mem::{align_of, offset_of, size_of};
 // LAYOUT REVISION
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Bump whenever the assertions below are intentionally re-vendored against a
-/// new engine layout. Stamped into every minted NFT so re-vendoring invalidates
-/// older NFTs rather than silently decoding with the wrong offsets.
+/// Bump whenever assertions are intentionally re-vendored against a new engine
+/// layout. Stamped into every minted NFT so re-vendoring invalidates older NFTs
+/// rather than silently decoding with wrong offsets.
 ///
-/// Revision 3: v16 account-local layout (`PortfolioAccountV16Account`,
-/// 2907-byte fixed head). Supersedes revision 2 (v12.17 slab layout in
-/// `slab_types.rs`).
-pub const LAYOUT_REVISION: u32 = 3;
+/// Revision 4: v17 layout — 9179-byte fixed `PortfolioAccountV16Account` with
+/// inline `source_domains` array + residual counters. Supersedes revision 3
+/// (v16 2907-byte head, variable 2N source-domain tail).
+pub const LAYOUT_REVISION: u32 = 4;
 
 // ════════════════════════════════════════════════════════════════════════════
-// WRAPPER ACCOUNT HEADER — percolator-prog/src/v16_program.rs:44-51, 450-471
+// WRAPPER ACCOUNT HEADER — percolator-prog/src/v16_program.rs constants
 // ════════════════════════════════════════════════════════════════════════════
 
 /// `"PERCV16\0"` little-endian. Byte 0..8 of every wrapper account.
@@ -83,28 +76,34 @@ pub const HEADER_LEN: usize = 16;
 // ENGINE CONSTANTS — percolator/src/v16.rs
 // ════════════════════════════════════════════════════════════════════════════
 
-/// `ProvenanceHeaderV16.layout_discriminator` must equal this (v16 guard).
+/// `ProvenanceHeaderV16.layout_discriminator` must equal this (v16/v17 guard).
 pub const V16_LAYOUT_DISCRIMINATOR: u16 = 16;
 /// `ProvenanceHeaderV16.version` must equal this.
 pub const V16_ACCOUNT_VERSION: u16 = 1;
-/// Number of leg slots in a portfolio's `legs` array.
+/// Number of leg slots in a portfolio's `legs` array (V16_MAX_PORTFOLIO_ASSETS_N).
 pub const V16_MAX_PORTFOLIO_ASSETS_N: usize = 16;
-/// `ceil(V16_MAX_PORTFOLIO_ASSETS_N / 64)`.
+/// `ceil(V16_MAX_PORTFOLIO_ASSETS_N / 64)` = 1.
 pub const V16_ACTIVE_BITMAP_WORDS: usize = 1;
 /// Largest active-leg count the wrapper permits per portfolio (CU envelope).
 /// An NFT's `asset_index` must be `< WRAPPER_MAX_PORTFOLIO_ASSETS`.
 pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 14;
 
+/// v17: source-domains are now a fixed inline sparse array of this capacity.
+/// Production: 2 * V16_MAX_PORTFOLIO_ASSETS_N = 32.
+/// (kani uses 4 for tractability; the NFT program never runs kani.)
+pub const PORTFOLIO_SOURCE_DOMAIN_CAP: usize = 2 * V16_MAX_PORTFOLIO_ASSETS_N; // = 32
+
 // ════════════════════════════════════════════════════════════════════════════
-// EXPECTED SIZES — empirically verified against the engine crate
+// EXPECTED SIZES — empirically verified against the v17 engine crate
 // ════════════════════════════════════════════════════════════════════════════
 
 pub const EXPECTED_PROVENANCE_HEADER_SIZE: usize = 100;
 pub const EXPECTED_PORTFOLIO_LEG_SIZE: usize = 144;
+pub const EXPECTED_SOURCE_DOMAIN_SIZE: usize = 196;
 pub const EXPECTED_HEALTH_CERT_SIZE: usize = 121;
 pub const EXPECTED_CLOSE_PROGRESS_SIZE: usize = 184;
 pub const EXPECTED_RESOLVED_PAYOUT_RECEIPT_SIZE: usize = 66;
-pub const EXPECTED_PORTFOLIO_ACCOUNT_SIZE: usize = 2907;
+pub const EXPECTED_PORTFOLIO_ACCOUNT_SIZE: usize = 9179;
 
 // ════════════════════════════════════════════════════════════════════════════
 // POD SCALAR WRAPPERS — byte arrays, align 1 (percolator/src/v16.rs:3181-3255)
@@ -181,8 +180,7 @@ impl V16PodI128 {
 }
 
 /// Signed 64-bit, align-1 byte array. Used by the NFT's own `PositionNftV16`
-/// state (e.g. `minted_at`); the engine has no signed-u64 field so there is no
-/// engine counterpart, but the same byte-determinism discipline applies.
+/// state (e.g. `minted_at`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct V16PodI64 {
@@ -205,7 +203,7 @@ const _: () = assert!(size_of::<V16PodU128>() == 16 && align_of::<V16PodU128>() 
 const _: () = assert!(size_of::<V16PodI128>() == 16 && align_of::<V16PodI128>() == 1);
 
 // ════════════════════════════════════════════════════════════════════════════
-// ProvenanceHeaderV16Account — percolator/src/v16.rs:3301
+// ProvenanceHeaderV16Account — percolator/src/v16.rs:3937
 // ════════════════════════════════════════════════════════════════════════════
 
 #[repr(C)]
@@ -227,7 +225,7 @@ const _: () = assert!(offset_of!(ProvenanceHeaderV16Account, version) == 96);
 const _: () = assert!(offset_of!(ProvenanceHeaderV16Account, layout_discriminator) == 98);
 
 // ════════════════════════════════════════════════════════════════════════════
-// PortfolioLegV16Account — percolator/src/v16.rs:11410
+// PortfolioLegV16Account — percolator/src/v16.rs:14571
 // ════════════════════════════════════════════════════════════════════════════
 
 #[repr(C)]
@@ -262,7 +260,38 @@ const _: () = assert!(offset_of!(PortfolioLegV16Account, b_stale) == 142);
 const _: () = assert!(offset_of!(PortfolioLegV16Account, stale) == 143);
 
 // ════════════════════════════════════════════════════════════════════════════
-// HealthCertV16Account — percolator/src/v16.rs:11478
+// PortfolioSourceDomainV16Account — percolator/src/v16.rs:14842
+// NEW in v17: fixed inline sparse array replaces the 2N dynamic tail.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
+pub struct PortfolioSourceDomainV16Account {
+    pub domain: V16PodU32,
+    pub source_claim_market_id: V16PodU64,
+    pub source_claim_bound_num: V16PodU128,
+    pub source_claim_liened_num: V16PodU128,
+    pub source_claim_counterparty_liened_num: V16PodU128,
+    pub source_claim_insurance_liened_num: V16PodU128,
+    pub source_lien_effective_reserved: V16PodU128,
+    pub source_lien_counterparty_backing_num: V16PodU128,
+    pub source_lien_insurance_backing_num: V16PodU128,
+    pub source_lien_fee_last_slot: V16PodU64,
+    pub source_claim_impaired_num: V16PodU128,
+    pub source_lien_impaired_effective_reserved: V16PodU128,
+    pub source_lien_capital_at_risk_fee_revenue: V16PodU128,
+    pub source_lien_impaired_capital_at_risk_fee_revenue: V16PodU128,
+}
+
+const _: () = assert!(size_of::<PortfolioSourceDomainV16Account>() == EXPECTED_SOURCE_DOMAIN_SIZE);
+const _: () = assert!(align_of::<PortfolioSourceDomainV16Account>() == 1);
+// Field offset spot-checks (against engine v17):
+const _: () = assert!(offset_of!(PortfolioSourceDomainV16Account, domain) == 0);
+const _: () = assert!(offset_of!(PortfolioSourceDomainV16Account, source_claim_market_id) == 4);
+const _: () = assert!(offset_of!(PortfolioSourceDomainV16Account, source_claim_bound_num) == 12);
+
+// ════════════════════════════════════════════════════════════════════════════
+// HealthCertV16Account — percolator/src/v16.rs:14639
 // ════════════════════════════════════════════════════════════════════════════
 
 #[repr(C)]
@@ -285,7 +314,7 @@ const _: () = assert!(size_of::<HealthCertV16Account>() == EXPECTED_HEALTH_CERT_
 const _: () = assert!(align_of::<HealthCertV16Account>() == 1);
 
 // ════════════════════════════════════════════════════════════════════════════
-// CloseProgressLedgerV16Account — percolator/src/v16.rs:11530
+// CloseProgressLedgerV16Account — percolator/src/v16.rs:14691
 // ════════════════════════════════════════════════════════════════════════════
 
 #[repr(C)]
@@ -317,7 +346,7 @@ const _: () = assert!(offset_of!(CloseProgressLedgerV16Account, active) == 0);
 const _: () = assert!(offset_of!(CloseProgressLedgerV16Account, asset_index) == 11);
 
 // ════════════════════════════════════════════════════════════════════════════
-// ResolvedPayoutReceiptV16Account — percolator/src/v16.rs:11646
+// ResolvedPayoutReceiptV16Account — percolator/src/v16.rs:14807
 // ════════════════════════════════════════════════════════════════════════════
 
 #[repr(C)]
@@ -338,7 +367,17 @@ const _: () = assert!(offset_of!(ResolvedPayoutReceiptV16Account, present) == 64
 const _: () = assert!(offset_of!(ResolvedPayoutReceiptV16Account, finalized) == 65);
 
 // ════════════════════════════════════════════════════════════════════════════
-// PortfolioAccountV16Account — percolator/src/v16.rs:11755 (fixed head only)
+// PortfolioAccountV16Account — percolator/src/v16.rs:14898 (v17 layout)
+//
+// v17 changes vs v16:
+//   * `capital/pnl/reserved_pnl` replaced by `residual_crystallized_loss_atoms_total`,
+//     `residual_spent_principal_atoms_total`, `residual_received_atoms_total` (same 48 B).
+//   * `source_domains: [PortfolioSourceDomainV16Account; 32]` INSERTED between
+//     `legs` and `health_cert` (+6272 B). This is the dominant layout change.
+//   * The NFT reads: provenance_header, owner, legs, liquidation_lock,
+//     stale_state, b_stale_state, resolved_payout_receipt, close_progress.
+//     All are still present; health_cert / stale / lock / close_progress /
+//     resolved_payout_receipt shifted by +6272 B from prior offsets.
 // ════════════════════════════════════════════════════════════════════════════
 
 #[repr(C)]
@@ -346,14 +385,17 @@ const _: () = assert!(offset_of!(ResolvedPayoutReceiptV16Account, finalized) == 
 pub struct PortfolioAccountV16Account {
     pub provenance_header: ProvenanceHeaderV16Account,
     pub owner: [u8; 32],
-    pub capital: V16PodU128,
-    pub pnl: V16PodI128,
-    pub reserved_pnl: V16PodU128,
+    // v17 residual-farming counters (replaced v16 capital/pnl/reserved_pnl).
+    pub residual_crystallized_loss_atoms_total: V16PodU128,
+    pub residual_spent_principal_atoms_total: V16PodU128,
+    pub residual_received_atoms_total: V16PodU128,
     pub fee_credits: V16PodI128,
     pub cancel_deposit_escrow: V16PodU128,
     pub last_fee_slot: V16PodU64,
     pub active_bitmap: [V16PodU64; V16_ACTIVE_BITMAP_WORDS],
     pub legs: [PortfolioLegV16Account; V16_MAX_PORTFOLIO_ASSETS_N],
+    // v17 NEW: fixed inline sparse source-domain array (was a dynamic 2N tail).
+    pub source_domains: [PortfolioSourceDomainV16Account; PORTFOLIO_SOURCE_DOMAIN_CAP],
     pub health_cert: HealthCertV16Account,
     pub stale_state: u8,
     pub b_stale_state: u8,
@@ -365,17 +407,22 @@ pub struct PortfolioAccountV16Account {
 
 const _: () = assert!(size_of::<PortfolioAccountV16Account>() == EXPECTED_PORTFOLIO_ACCOUNT_SIZE);
 const _: () = assert!(align_of::<PortfolioAccountV16Account>() == 1);
+// Spot-check offsets that the NFT or its decode logic depend on.
 const _: () = assert!(offset_of!(PortfolioAccountV16Account, provenance_header) == 0);
 const _: () = assert!(offset_of!(PortfolioAccountV16Account, owner) == 100);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, capital) == 132);
+// residual counters at 132 (three × 16 = 48 B, same total as v16 capital/pnl/reserved_pnl)
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, fee_credits) == 180);
 const _: () = assert!(offset_of!(PortfolioAccountV16Account, last_fee_slot) == 212);
 const _: () = assert!(offset_of!(PortfolioAccountV16Account, active_bitmap) == 220);
 const _: () = assert!(offset_of!(PortfolioAccountV16Account, legs) == 228);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, health_cert) == 2532);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, stale_state) == 2653);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, liquidation_lock) == 2656);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, close_progress) == 2657);
-const _: () = assert!(offset_of!(PortfolioAccountV16Account, resolved_payout_receipt) == 2841);
+// source_domains inserted here: 228 + 144*16 = 228 + 2304 = 2532
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, source_domains) == 2532);
+// health_cert at 2532 + 196*32 = 2532 + 6272 = 8804
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, health_cert) == 8804);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, stale_state) == 8925);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, liquidation_lock) == 8928);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, close_progress) == 8929);
+const _: () = assert!(offset_of!(PortfolioAccountV16Account, resolved_payout_receipt) == 9113);
 
 // ════════════════════════════════════════════════════════════════════════════
 // DECODE — mirrors percolator-prog `portfolio_wire`
@@ -387,7 +434,7 @@ const _: () = assert!(offset_of!(PortfolioAccountV16Account, resolved_payout_rec
 pub enum PortfolioDecodeError {
     /// Account data shorter than `HEADER_LEN + EXPECTED_PORTFOLIO_ACCOUNT_SIZE`.
     TooShort,
-    /// Wrapper header MAGIC mismatch — not a percolator-v16 account.
+    /// Wrapper header MAGIC mismatch — not a percolator-v16/v17 account.
     BadMagic,
     /// Wrapper header VERSION mismatch.
     BadVersion,
@@ -404,9 +451,9 @@ pub enum PortfolioDecodeError {
 }
 
 /// Decode a wrapper-owned portfolio account's raw data into the vendored fixed
-/// head. Validates the wrapper header, the v16 provenance guard, and the
-/// engine's `owner == provenance_header.owner` invariant. The variable
-/// source-domain tail (if any) is ignored — the NFT never reads it.
+/// head. Validates the wrapper header, the v16/v17 provenance guard, and the
+/// engine's `owner == provenance_header.owner` invariant. Any bytes beyond the
+/// fixed head (e.g. inline matcher-config tail) are ignored.
 ///
 /// SECURITY: this is the only place the NFT interprets portfolio bytes. The
 /// body offset is the constant [`HEADER_LEN`] and field access is by name; no
@@ -451,7 +498,7 @@ impl PortfolioAccountV16Account {
     }
 
     /// Find the leg slot whose leg is active and trades `asset_index`. Mirrors
-    /// the engine's `active_leg_slot_for_asset` (`v16.rs:2170`). `asset_index`
+    /// the engine's `active_leg_slot_for_asset` (`v16.rs:~14932`). `asset_index`
     /// is the asset identifier — NOT the array slot — so this scans the array.
     /// Returns `None` if no active leg trades that asset.
     pub fn active_leg_slot_for_asset(&self, asset_index: u32) -> Option<usize> {
@@ -476,14 +523,12 @@ impl PortfolioAccountV16Account {
     }
 
     /// Decide whether the leg trading `asset_index` may have its ownership /
-    /// NFT freely transferred RIGHT NOW. This is the single consolidated gate
-    /// the transfer-hook and the wrapper's B-3 `TransferPortfolioOwnership`
-    /// must both consult — it encodes original NFT bug #3 (closed/resolved
-    /// position transfer must be blocked) against the v16 close/resolve model.
+    /// NFT freely transferred RIGHT NOW. Single consolidated gate for both
+    /// the transfer-hook and the wrapper's B-3 `TransferPortfolioOwnership`.
     ///
     /// Returns `Transferable(slot)` only when an active leg for the asset
     /// exists AND no close/resolve/stale/lock gate is engaged; otherwise the
-    /// precise blocking reason (callers map it to an error / EmergencyBurn).
+    /// precise blocking reason.
     pub fn leg_transfer_gate(&self, asset_index: u32) -> LegTransferGate {
         let slot = match self.active_leg_slot_for_asset(asset_index) {
             Some(s) => s,
@@ -536,6 +581,7 @@ mod tests {
 
     /// Build a minimal valid wrapper-framed portfolio buffer for an owner with a
     /// single active leg. Mirrors the wrapper's `[header][POD][tail]` framing.
+    /// v17: the POD is 9179 B; the tail (inline matcher cfg) is ignored by NFT.
     fn framed(owner: [u8; 32], asset_index: u32, market_id: u64) -> Vec<u8> {
         let mut acct = empty_account();
         acct.provenance_header.owner = owner;
@@ -546,7 +592,8 @@ mod tests {
         acct.legs[3].asset_index = V16PodU32::new(asset_index);
         acct.legs[3].market_id = V16PodU64::new(market_id);
 
-        let mut buf = vec![0u8; HEADER_LEN + EXPECTED_PORTFOLIO_ACCOUNT_SIZE + 64];
+        // Allocate enough for header + POD + small tail (simulate the matcher cfg tail).
+        let mut buf = vec![0u8; HEADER_LEN + EXPECTED_PORTFOLIO_ACCOUNT_SIZE + 104];
         buf[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         buf[8..10].copy_from_slice(&VERSION.to_le_bytes());
         buf[10] = KIND_PORTFOLIO;
@@ -557,12 +604,24 @@ mod tests {
 
     #[test]
     fn sizes_match_engine_ground_truth() {
-        assert_eq!(size_of::<PortfolioAccountV16Account>(), 2907);
+        // These values must match the v17 engine's actual struct sizes.
+        assert_eq!(size_of::<PortfolioAccountV16Account>(), 9179);
         assert_eq!(size_of::<ProvenanceHeaderV16Account>(), 100);
         assert_eq!(size_of::<PortfolioLegV16Account>(), 144);
+        assert_eq!(size_of::<PortfolioSourceDomainV16Account>(), 196);
         assert_eq!(size_of::<CloseProgressLedgerV16Account>(), 184);
         assert_eq!(size_of::<HealthCertV16Account>(), 121);
         assert_eq!(size_of::<ResolvedPayoutReceiptV16Account>(), 66);
+        // Derived totals:
+        assert_eq!(
+            PORTFOLIO_SOURCE_DOMAIN_CAP * size_of::<PortfolioSourceDomainV16Account>(),
+            32 * 196,
+        );
+    }
+
+    #[test]
+    fn v17_layout_revision_is_4() {
+        assert_eq!(LAYOUT_REVISION, 4);
     }
 
     #[test]
@@ -689,5 +748,21 @@ mod tests {
         assert!(!acct.portfolio_locked_or_stale());
         acct.liquidation_lock = 1;
         assert!(acct.portfolio_locked_or_stale());
+    }
+
+    #[test]
+    fn source_domain_cap_is_correct() {
+        // Confirm that the production cap (2 * V16_MAX_PORTFOLIO_ASSETS_N) is
+        // what we compiled with, not the kani-only 4-slot value.
+        assert_eq!(PORTFOLIO_SOURCE_DOMAIN_CAP, 32);
+        assert_eq!(
+            size_of::<PortfolioAccountV16Account>(),
+            // Header (100) + owner (32) + residuals (48) + fee_credits (16) +
+            // cancel_escrow (16) + last_fee_slot (8) + bitmap (8) +
+            // legs (144*16) + source_domains (196*32) +
+            // health_cert (121) + 4 lock bytes + close_progress (184) +
+            // resolved_receipt (66)
+            100 + 32 + 48 + 16 + 16 + 8 + 8 + 2304 + 6272 + 121 + 4 + 184 + 66
+        );
     }
 }

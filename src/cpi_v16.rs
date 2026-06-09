@@ -25,6 +25,7 @@
 //!   * `leg.epoch_snap` advances with funding → useless as a reuse gate
 //!     (would false-positive on normal funding accrual).
 //!   * `leg.basis_pos_q` changes as the position is traded → not an identity.
+//!
 //! So the reuse check is `market_id`-only (design-correction (b), §16.2). The
 //! mint-time `epoch_snap`/`position_owner` snapshots are kept informational.
 
@@ -162,10 +163,12 @@ pub fn emergency_burn_ok(
         None => Ok(()), // no active leg → bound position closed/gone
         Some(slot) => {
             let leg = &portfolio.legs[slot];
-            if leg.market_id.get() != nft.market_id_at_mint.get() {
-                Ok(()) // bound position gone; asset slot reused by a newer position
-            } else if leg.basis_pos_q.get() == 0 {
-                Ok(()) // bound position flat (liquidated / fully reduced)
+            // Eligible if the bound position is gone (slot reused with a newer
+            // market_id) OR the bound leg is flat (liquidated / fully reduced).
+            if leg.market_id.get() != nft.market_id_at_mint.get()
+                || leg.basis_pos_q.get() == 0
+            {
+                Ok(())
             } else {
                 Err(NftError::PositionNotClosed) // bound position still open → use normal Burn
             }
